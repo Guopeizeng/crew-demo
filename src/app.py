@@ -1,11 +1,13 @@
 """
 Crew Demo - 周报聚合场景
-最小可演示版本 v0.4
+最小可演示版本 v0.5
 
-新增：
-- visibility 字段（public | private_to_sender | private_to_target | private_to_group）
-- Agent Profile（借鉴 AgentBridge 的主人认知 Profile）
-- Pheromone 反馈学习（借鉴 Moxt 的共享记忆——所有 Agent 都学到）
+新增（借鉴四个产品）：
+- visibility 字段（Bloome 启发）
+- Agent Profile（AgentBridge 启发）
+- Pheromone 反馈学习（Moxt 启发）
+- Agent 主动发起 Pheromone（Multica 启发）
+- 内容质量评分（基于 feedback 统计）
 
 run: python src/app.py
 """
@@ -18,7 +20,6 @@ app = Flask(__name__)
 # ============ Agent Profile（借鉴 AgentBridge） ============
 
 class AgentProfile:
-    """Agent 的认知 Profile——让 Agent 知道自己是谁、该以什么角度响应"""
     def __init__(self, agent_id, name, ep, role, judgment_criteria=None, peer_eps=None, specialty=None):
         self.agent_id = agent_id
         self.name = name
@@ -27,10 +28,9 @@ class AgentProfile:
         self.judgment_criteria = judgment_criteria or []
         self.peer_eps = peer_eps or []
         self.specialty = specialty or ""
-        self.learned_patterns = []  # 从反馈中学到的 pattern（借鉴 Moxt）
+        self.learned_patterns = []
 
     def add_learned(self, pattern):
-        """从反馈中学习"""
         for p in self.learned_patterns:
             if p["pattern"] == pattern:
                 p["count"] += 1
@@ -49,7 +49,6 @@ class AgentProfile:
             "learned_patterns": self.learned_patterns
         }
 
-# 预定义的 Agent Profiles
 AGENT_PROFILES = {
     "employee_zeng": AgentProfile(
         agent_id="employee_zeng",
@@ -91,18 +90,14 @@ AGENT_PROFILES = {
 
 # ============ Pheromone 反馈学习（借鉴 Moxt） ============
 
-# 内存存储：反馈记录
 feedbacks = []
 
-# 全局学习统计（Moxt 的"纠正一个 Agent 的错误，所有 Agent 都学到"）
 GLOBAL_LEARNINGS = {
     "useful_patterns": [],
     "unclear_patterns": [],
 }
 
 def learn_from_feedback(sender_id, feedback_type, content):
-    """从反馈中学习——更新全局学习统计 + 单个 Agent Profile"""
-    # 1. 更新全局学习统计
     pattern_key = f"{sender_id}_{feedback_type}"
     if feedback_type == "useful":
         found = False
@@ -124,29 +119,47 @@ def learn_from_feedback(sender_id, feedback_type, content):
             "from_agent": sender_id
         })
 
-    # 2. 更新单个 Agent Profile（借鉴 Moxt：所有 Agent 都学到）
     profile = AGENT_PROFILES.get(sender_id)
     if profile:
-        # 提取内容关键词作为 pattern
         keywords = content.split("：")[1][:20] if "：" in content else content[:20]
         profile.add_learned(keywords)
 
 def get_learned_for_agent(agent_id):
-    """获取某个 Agent 学到的内容"""
     profile = AGENT_PROFILES.get(agent_id)
     if not profile:
         return {}
-
     return {
         "learned_patterns": profile.learned_patterns,
-        "global_useful": [
-            p for p in GLOBAL_LEARNINGS["useful_patterns"]
-            if p.get("from_agent") == agent_id
-        ],
-        "global_unclear": [
-            p for p in GLOBAL_LEARNINGS["unclear_patterns"]
-            if p.get("from_agent") == agent_id
-        ]
+        "global_useful": [p for p in GLOBAL_LEARNINGS["useful_patterns"] if p.get("from_agent") == agent_id],
+        "global_unclear": [p for p in GLOBAL_LEARNINGS["unclear_patterns"] if p.get("from_agent") == agent_id]
+    }
+
+# ============ 内容质量评分（基于 feedback） ============
+
+def calculate_quality_score(pheromone_id):
+    """基于 feedback 统计计算内容质量评分 0-100"""
+    useful_count = 0
+    unclear_count = 0
+
+    for p in pheromones:
+        if p.parent_pheromone_id == pheromone_id and p.type == "feedback":
+            fb = p.metadata.get("feedback_type")
+            if fb == "useful":
+                useful_count += 1
+            elif fb == "unclear":
+                unclear_count += 1
+
+    total = useful_count + unclear_count
+    if total == 0:
+        return None
+
+    # 分数 = 有用率 × 100
+    score = int((useful_count / total) * 100)
+    return {
+        "score": score,
+        "useful": useful_count,
+        "unclear": unclear_count,
+        "total": total
     }
 
 # ============ 数据模型 ============
@@ -166,7 +179,7 @@ class Pheromone:
         self.visibility = visibility
         self.visible_to = visible_to or []
         self.timestamp = datetime.utcnow().isoformat() + "Z"
-        self.feedback_given = []  # 记录谁给过反馈
+        self.feedback_given = []
 
     def to_dict(self, viewer=None):
         d = {
@@ -181,7 +194,6 @@ class Pheromone:
             "visibility": self.visibility,
             "timestamp": self.timestamp
         }
-        # 权限过滤
         if self.visibility == "public":
             pass
         elif self.visibility == "private_to_sender":
@@ -204,7 +216,6 @@ PARTICIPANTS = {
     "hr_li": {"name": "李HR", "ep": "EP004", "role": "HR"},
 }
 
-# 内存存储
 pheromones = []
 pending_responses = {}
 
@@ -221,7 +232,6 @@ def get_agent_profiles():
 @app.route("/api/agents/profiles/<agent_id>", methods=["GET"])
 def get_agent_profile(agent_id):
     if agent_id in AGENT_PROFILES:
-        # 合并学习到的内容
         result = AGENT_PROFILES[agent_id].to_dict()
         result["learned"] = get_learned_for_agent(agent_id)
         return jsonify(result)
@@ -241,10 +251,55 @@ def update_agent_profile(agent_id):
         profile.specialty = data["specialty"]
     return jsonify(profile.to_dict())
 
+@app.route("/api/agents/<agent_id>/create_task", methods=["POST"])
+def agent_create_task(agent_id):
+    """Agent 主动创建 Task Pheromone（借鉴 Multica）"""
+    if agent_id not in AGENT_PROFILES:
+        return jsonify({"error": "agent not found"}), 404
+
+    data = request.json
+    task_content = data.get("content")
+    task_type = data.get("task_type", "task")  # task | issue | question
+
+    if not task_content:
+        return jsonify({"error": "content required"}), 400
+
+    # Agent 创建 task pheromone
+    p = Pheromone(
+        type=task_type,
+        sender=agent_id,
+        targets=data.get("targets", []),
+        content=task_content,
+        parent_pheromone_id=data.get("parent_pheromone_id"),
+        metadata={
+            "task_priority": data.get("priority", "medium"),
+            "task_status": "open",
+            "created_by_agent": agent_id,
+            "agent_profile": AGENT_PROFILES[agent_id].to_dict()
+        },
+        visibility=data.get("visibility", "public")
+    )
+    pheromones.append(p)
+
+    return jsonify({
+        "status": "created",
+        "pheromone": p.to_dict(),
+        "creator_profile": AGENT_PROFILES[agent_id].to_dict()
+    }), 201
+
 @app.route("/api/pheromones", methods=["GET"])
 def get_pheromones():
     viewer = request.args.get("viewer")
-    return jsonify([p.to_dict(viewer) for p in pheromones])
+    result = []
+    for p in pheromones:
+        d = p.to_dict(viewer)
+        # 附加质量评分
+        if p.type in ["weekly_report", "weekly_digest"]:
+            score = calculate_quality_score(p.id)
+            if score:
+                d["quality_score"] = score
+        result.append(d)
+    return jsonify(result)
 
 @app.route("/api/pheromones", methods=["POST"])
 def create_pheromone():
@@ -275,14 +330,18 @@ def get_pheromone(pid):
     viewer = request.args.get("viewer")
     for p in pheromones:
         if p.id == pid:
-            return jsonify(p.to_dict(viewer))
+            d = p.to_dict(viewer)
+            if p.type in ["weekly_report", "weekly_digest"]:
+                score = calculate_quality_score(p.id)
+                if score:
+                    d["quality_score"] = score
+            return jsonify(d)
     return jsonify({"error": "not found"}), 404
 
 @app.route("/api/pheromones/<pid>/feedback", methods=["POST"])
 def add_feedback(pid):
-    """对 Pheromone 添加反馈"""
     data = request.json
-    feedback_type = data.get("feedback_type")  # useful | not_useful | unclear
+    feedback_type = data.get("feedback_type")
     sender_id = data.get("sender")
 
     for p in pheromones:
@@ -292,15 +351,32 @@ def add_feedback(pid):
                 "type": feedback_type,
                 "timestamp": datetime.utcnow().isoformat() + "Z"
             })
-            # 学习：借鉴 Moxt 的"纠正一个 Agent 的错误，所有 Agent 都学到"
+            # 创建 feedback pheromone（用于质量评分计算）
+            fb = Pheromone(
+                type="feedback",
+                sender=sender_id,
+                content=f"反馈：{feedback_type}",
+                parent_pheromone_id=pid,
+                metadata={"feedback_type": feedback_type}
+            )
+            pheromones.append(fb)
             learn_from_feedback(sender_id, feedback_type, p.content)
             return jsonify({"status": "ok", "learned": get_learned_for_agent(sender_id)})
 
     return jsonify({"error": "not found"}), 404
 
+@app.route("/api/pheromones/<pid>/resolve", methods=["POST"])
+def resolve_task(pid):
+    """解决 Task Pheromone（借鉴 Multica）"""
+    for p in pheromones:
+        if p.id == pid and p.type in ["task", "issue"]:
+            p.metadata["task_status"] = "resolved"
+            p.judgment_status = "resolved"
+            return jsonify({"status": "resolved", "pheromone": p.to_dict()})
+    return jsonify({"error": "not found or not a task"}), 404
+
 @app.route("/api/learnings", methods=["GET"])
 def get_global_learnings():
-    """获取全局学习统计"""
     return jsonify(GLOBAL_LEARNINGS)
 
 @app.route("/api/chain/<pid>", methods=["GET"])
@@ -342,7 +418,6 @@ def reset():
     pheromones = []
     feedbacks = []
     GLOBAL_LEARNINGS = {"useful_patterns": [], "unclear_patterns": []}
-    # 重置 Agent Profile 的学习记录
     for profile in AGENT_PROFILES.values():
         profile.learned_patterns = []
     return jsonify({"status": "reset"})
@@ -388,7 +463,6 @@ def handle_approval(p):
                 break
 
 def handle_feedback(p):
-    """处理反馈 Pheromone"""
     feedback_type = p.metadata.get("feedback_type")
     if feedback_type and p.sender:
         learn_from_feedback(p.sender, feedback_type, p.content)
@@ -402,7 +476,7 @@ def index():
 <html lang="zh">
 <head>
     <meta charset="UTF-8">
-    <title>Crew Demo - 周报聚合</title>
+    <title>Crew Demo v0.5</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -412,31 +486,18 @@ def index():
             min-height: 100vh;
             padding: 40px;
         }
-        h1 {
-            text-align: center;
-            font-size: 28px;
-            font-weight: 600;
-            margin-bottom: 8px;
-            color: #fff;
-        }
-        .subtitle {
-            text-align: center;
-            color: #666;
-            margin-bottom: 40px;
-        }
-        .container {
-            max-width: 1100px;
-            margin: 0 auto;
-        }
+        h1 { text-align: center; font-size: 28px; font-weight: 600; margin-bottom: 8px; color: #fff; }
+        .subtitle { text-align: center; color: #666; margin-bottom: 40px; }
+        .container { max-width: 1200px; margin: 0 auto; }
 
-        .flow-diagram, .action-area, .result-area, .profile-area, .learning-area {
+        .card {
             background: #111118;
             border: 1px solid #222;
             border-radius: 12px;
             padding: 30px;
             margin-bottom: 30px;
         }
-        .flow-title, .action-title, .result-title {
+        .card-title {
             font-size: 14px;
             color: #666;
             margin-bottom: 20px;
@@ -446,7 +507,7 @@ def index():
 
         .status-panel {
             display: grid;
-            grid-template-columns: repeat(4, 1fr);
+            grid-template-columns: repeat(5, 1fr);
             gap: 15px;
             margin-bottom: 30px;
         }
@@ -457,16 +518,8 @@ def index():
             padding: 15px;
             text-align: center;
         }
-        .status-number {
-            font-size: 32px;
-            font-weight: 700;
-            color: #6366f1;
-        }
-        .status-label {
-            font-size: 12px;
-            color: #666;
-            margin-top: 4px;
-        }
+        .status-number { font-size: 32px; font-weight: 700; color: #6366f1; }
+        .status-label { font-size: 12px; color: #666; margin-top: 4px; }
 
         .flow-nodes {
             display: flex;
@@ -498,7 +551,6 @@ def index():
             border-radius: 8px;
             margin-bottom: 10px;
         }
-        .pheromone-line.processed { opacity: 0.6; }
         .pheromone-badge {
             background: #6366f1;
             color: #fff;
@@ -510,27 +562,31 @@ def index():
             text-align: center;
         }
         .pheromone-badge.private { background: #f59e0b; }
-        .pheromone-badge.feedback { background: #ec4899; }
-        .pheromone-content {
-            flex: 1;
-            font-size: 14px;
-            color: #aaa;
-        }
-        .pheromone-status {
-            font-size: 12px;
-            padding: 4px 10px;
-            border-radius: 4px;
-        }
+        .pheromone-badge.task { background: #8b5cf6; }
+        .pheromone-badge.issue { background: #ef4444; }
+        .pheromone-content { flex: 1; font-size: 14px; color: #aaa; }
+        .pheromone-status { font-size: 12px; padding: 4px 10px; border-radius: 4px; }
         .pheromone-status.pending { background: #fbbf24; color: #000; }
         .pheromone-status.approved { background: #22c55e; color: #000; }
+        .pheromone-status.resolved { background: #6366f1; color: #fff; }
+
+        .quality-score {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            background: #1a1a24;
+            border: 1px solid #333;
+            border-radius: 4px;
+            padding: 2px 8px;
+            font-size: 11px;
+            margin-left: 8px;
+        }
+        .quality-score.high { border-color: #22c55e; color: #22c55e; }
+        .quality-score.medium { border-color: #f59e0b; color: #f59e0b; }
+        .quality-score.low { border-color: #ef4444; color: #ef4444; }
 
         .form-group { margin-bottom: 20px; }
-        .form-group label {
-            display: block;
-            font-size: 13px;
-            color: #888;
-            margin-bottom: 8px;
-        }
+        .form-group label { display: block; font-size: 13px; color: #888; margin-bottom: 8px; }
         textarea {
             width: 100%;
             background: #1a1a24;
@@ -544,7 +600,7 @@ def index():
             font-family: inherit;
         }
         textarea:focus { outline: none; border-color: #6366f1; }
-        select {
+        select, input[type="text"] {
             width: 100%;
             background: #1a1a24;
             border: 1px solid #333;
@@ -566,13 +622,19 @@ def index():
         }
         button:hover { background: #5558e3; }
         button:disabled { background: #333; cursor: not-allowed; }
-        .reset-btn {
+        .btn-secondary {
             background: transparent;
             border: 1px solid #333;
-            color: #666;
-            margin-left: 10px;
+            color: #888;
         }
-        .reset-btn:hover { border-color: #6366f1; color: #6366f1; }
+        .btn-secondary:hover { border-color: #6366f1; color: #6366f1; }
+        .btn-agent {
+            background: #8b5cf6;
+        }
+        .btn-agent:hover { background: #7c3aed; }
+        .btn-small { padding: 6px 12px; font-size: 12px; }
+        .btn-resolve { background: #22c55e; }
+        .btn-resolve:hover { background: #16a34a; }
 
         .viewer-switch {
             display: flex;
@@ -605,12 +667,7 @@ def index():
         }
         .profile-card.agent { border-left: 3px solid #6366f1; }
         .profile-card.human { border-left: 3px solid #22c55e; }
-        .profile-header {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            margin-bottom: 10px;
-        }
+        .profile-header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
         .profile-avatar {
             width: 36px;
             height: 36px;
@@ -648,13 +705,6 @@ def index():
         .profile-tag.specialty { border-color: #f59e0b; color: #f59e0b; }
         .profile-tag.learned { border-color: #ec4899; color: #ec4899; }
 
-        .learning-section {
-            background: #16161e;
-            border-radius: 8px;
-            padding: 15px;
-            margin-bottom: 15px;
-        }
-        .learning-title { font-size: 14px; color: #fff; margin-bottom: 10px; }
         .learning-item {
             display: flex;
             align-items: center;
@@ -684,6 +734,22 @@ def index():
         .feedback-btn.useful { background: #22c55e; color: #000; }
         .feedback-btn.unclear { background: #f59e0b; color: #000; }
 
+        .task-section {
+            background: #1a1a24;
+            border: 1px dashed #8b5cf6;
+            border-radius: 8px;
+            padding: 15px;
+            margin-top: 20px;
+        }
+        .task-section-title {
+            font-size: 13px;
+            color: #8b5cf6;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
         .empty-state {
             text-align: center;
             padding: 40px 20px;
@@ -693,13 +759,13 @@ def index():
 </head>
 <body>
     <div class="container">
-        <h1>Crew Demo</h1>
-        <p class="subtitle">信息自己知道去哪 · Pheromone 链演示</p>
+        <h1>Crew Demo <span style="font-size:14px;color:#666">v0.5</span></h1>
+        <p class="subtitle">借鉴 Bloome · AgentBridge · Moxt · Multica</p>
 
         <div class="status-panel">
             <div class="status-card">
                 <div class="status-number" id="total-count">0</div>
-                <div class="status-label">总 Pheromone 数</div>
+                <div class="status-label">总 Pheromone</div>
             </div>
             <div class="status-card">
                 <div class="status-number" id="pending-count">0</div>
@@ -713,17 +779,21 @@ def index():
                 <div class="status-number" id="learned-count">0</div>
                 <div class="status-label">学习次数</div>
             </div>
+            <div class="status-card">
+                <div class="status-number" id="task-count">0</div>
+                <div class="status-label">活跃任务</div>
+            </div>
         </div>
 
-        <div class="profile-area">
-            <div class="flow-title">Agent Profile · 认知 Profile</div>
+        <div class="card">
+            <div class="card-title">Agent Profile · 认知 Profile</div>
             <div class="profile-grid" id="profile-grid">
                 <div class="empty-state">加载中...</div>
             </div>
         </div>
 
-        <div class="flow-diagram">
-            <div class="flow-title">信息流图</div>
+        <div class="card">
+            <div class="card-title">信息流图</div>
             <div class="flow-nodes">
                 <div class="node human">
                     <div class="node-name">增</div>
@@ -746,12 +816,12 @@ def index():
                 </div>
             </div>
             <div id="pheromone-list">
-                <div class="empty-state">暂无信息，等待提交周报...</div>
+                <div class="empty-state">暂无信息...</div>
             </div>
         </div>
 
-        <div class="action-area">
-            <div class="action-title">提交周报</div>
+        <div class="card">
+            <div class="card-title">提交周报</div>
             <div class="form-group">
                 <label>本周完成的工作</label>
                 <textarea id="report-content" placeholder="例如：完成了用户访谈、整理了需求文档..."></textarea>
@@ -766,34 +836,62 @@ def index():
                 </select>
             </div>
             <button onclick="submitReport()">提交周报</button>
-            <button class="reset-btn" onclick="resetDemo()">重置</button>
+            <button class="btn-secondary" onclick="resetDemo()">重置</button>
         </div>
 
-        <div class="learning-area">
-            <div class="flow-title">全局学习统计（Moxt 借鉴：所有 Agent 都学到）</div>
-            <div class="learning-section">
-                <div class="learning-title">有用的 Pattern</div>
-                <div id="useful-patterns">
-                    <div class="empty-state">暂无</div>
+        <div class="card">
+            <div class="card-title">Agent 主动发起 Task（借鉴 Multica）</div>
+            <div class="task-section">
+                <div class="task-section-title">
+                    <span>🎯</span>
+                    <span>Boss Agent 可以主动发现问题并创建任务</span>
                 </div>
+                <div class="form-group">
+                    <label>任务内容（由 Boss Agent 发现）</label>
+                    <input type="text" id="task-content" placeholder="例如：周报提交率偏低，建议提醒未提交人员">
+                </div>
+                <div class="form-group">
+                    <label>任务类型</label>
+                    <select id="task-type">
+                        <option value="task">任务</option>
+                        <option value="issue">问题</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>优先级</label>
+                    <select id="task-priority">
+                        <option value="low">低</option>
+                        <option value="medium" selected>中</option>
+                        <option value="high">高</option>
+                    </select>
+                </div>
+                <button class="btn-agent" onclick="createTask()">Boss Agent 创建任务</button>
             </div>
-            <div class="learning-section">
-                <div class="learning-title">被标记为"不理解"的 Pattern</div>
-                <div id="unclear-patterns">
-                    <div class="empty-state">暂无</div>
+        </div>
+
+        <div class="card">
+            <div class="card-title">全局学习统计（借鉴 Moxt）</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:15px;">
+                <div style="background:#16161e;border-radius:8px;padding:15px;">
+                    <div style="font-size:13px;color:#22c55e;margin-bottom:10px;">有用的 Pattern</div>
+                    <div id="useful-patterns"><div class="empty-state">暂无</div></div>
+                </div>
+                <div style="background:#16161e;border-radius:8px;padding:15px;">
+                    <div style="font-size:13px;color:#f59e0b;margin-bottom:10px;">被标记为"不理解"的 Pattern</div>
+                    <div id="unclear-patterns"><div class="empty-state">暂无</div></div>
                 </div>
             </div>
         </div>
 
-        <div class="result-area">
-            <div class="action-title">链路追溯</div>
+        <div class="card">
+            <div class="card-title">链路追溯</div>
             <div class="viewer-switch">
                 <span style="color:#666;font-size:13px;margin-right:10px;">模拟视角：</span>
                 <button class="viewer-btn active" onclick="setViewer(null)">全局视图</button>
-                <button class="viewer-btn" onclick="setViewer('employee_zeng')">增 (EP001)</button>
-                <button class="viewer-btn" onclick="setViewer('boss_agent')">Boss Agent (EP002)</button>
-                <button class="viewer-btn" onclick="setViewer('manager_peng')">彭老板 (EP003)</button>
-                <button class="viewer-btn" onclick="setViewer('hr_li')">李HR (EP004)</button>
+                <button class="viewer-btn" onclick="setViewer('employee_zeng')">增</button>
+                <button class="viewer-btn" onclick="setViewer('boss_agent')">Boss</button>
+                <button class="viewer-btn" onclick="setViewer('manager_peng')">彭老板</button>
+                <button class="viewer-btn" onclick="setViewer('hr_li')">李HR</button>
             </div>
             <div id="chain-list">
                 <div class="empty-state">暂无链路...</div>
@@ -814,14 +912,10 @@ def index():
 
         async function submitReport() {
             const content = document.getElementById("report-content").value.trim();
-            if (!content) {
-                alert("请填写周报内容");
-                return;
-            }
+            if (!content) { alert("请填写周报内容"); return; }
             const visibility = document.getElementById("report-visibility").value;
-            const btn = document.querySelector(".action-area button");
+            const btn = document.querySelector(".card:nth-child(4) button");
             btn.disabled = true;
-            btn.textContent = "提交中...";
 
             try {
                 await fetch("/api/pheromones", {
@@ -840,7 +934,30 @@ def index():
                 await refresh();
             } finally {
                 btn.disabled = false;
-                btn.textContent = "提交周报";
+            }
+        }
+
+        async function createTask() {
+            const content = document.getElementById("task-content").value.trim();
+            const taskType = document.getElementById("task-type").value;
+            const priority = document.getElementById("task-priority").value;
+
+            if (!content) { alert("请填写任务内容"); return; }
+
+            const res = await fetch("/api/agents/boss_agent/create_task", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({
+                    content: content,
+                    task_type: taskType,
+                    priority: priority,
+                    targets: ["manager_peng", "hr_li"]
+                })
+            });
+
+            if (res.ok) {
+                document.getElementById("task-content").value = "";
+                await refresh();
             }
         }
 
@@ -860,6 +977,11 @@ def index():
             await refresh();
         }
 
+        async function resolveTask(pheromoneId) {
+            await fetch(`/api/pheromones/${pheromoneId}/resolve`, { method: "POST" });
+            await refresh();
+        }
+
         async function giveFeedback(pheromoneId, feedbackType) {
             await fetch(`/api/pheromones/${pheromoneId}/feedback`, {
                 method: "POST",
@@ -870,6 +992,7 @@ def index():
                 })
             });
             await loadLearning();
+            await refresh();
         }
 
         async function loadLearning() {
@@ -902,9 +1025,15 @@ def index():
                 `).join("");
             }
 
-            // 更新学习次数
             const total = data.useful_patterns.length + data.unclear_patterns.length;
             document.getElementById("learned-count").textContent = total;
+        }
+
+        function getQualityBadge(score) {
+            if (score === null) return '';
+            const cls = score >= 70 ? 'high' : score >= 40 ? 'medium' : 'low';
+            const label = score >= 70 ? '优秀' : score >= 40 ? '一般' : '待改进';
+            return `<span class="quality-score ${cls}">📊 ${score} ${label}</span>`;
         }
 
         async function refresh() {
@@ -916,38 +1045,51 @@ def index():
             document.getElementById("pending-count").textContent = data.filter(p => p.judgment_status === "pending").length;
             document.getElementById("approved-count").textContent = data.filter(p => p.judgment_status === "approved").length;
 
+            const tasks = data.filter(p => p.type === 'task' || p.type === 'issue');
+            const openTasks = tasks.filter(p => p.metadata?.task_status !== 'resolved');
+            document.getElementById("task-count").textContent = openTasks.length;
+
             const list = document.getElementById("pheromone-list");
             if (data.length === 0) {
-                list.innerHTML = '<div class="empty-state">暂无信息，等待提交周报...</div>';
+                list.innerHTML = '<div class="empty-state">暂无信息...</div>';
             } else {
                 list.innerHTML = data.map(p => {
-                    const statusClass = p.judgment_status === "pending" ? "pending" : "approved";
-                    const statusText = p.judgment_status === "pending" ? "待审批" : "已审批";
-                    const isProcessed = p.type === "approval";
-                    const isPrivate = p.visibility !== "public";
-                    const isFeedback = p.type === "feedback";
+                    const statusClass = p.judgment_status === "pending" ? "pending" :
+                                       p.judgment_status === "resolved" ? "resolved" : "approved";
+                    const statusText = p.judgment_status === "pending" ? "待审批" :
+                                      p.judgment_status === "resolved" ? "已解决" : "已审批";
+
                     let badgeClass = "pheromone-badge";
-                    if (isPrivate) badgeClass += " private";
-                    if (isFeedback) badgeClass += " feedback";
-                    const privateHint = isPrivate ? `<span class="private-hint">${p.visibility}</span>` : "";
+                    if (p.type === 'task') badgeClass += " task";
+                    else if (p.type === 'issue') badgeClass += " issue";
+                    else if (p.visibility !== "public") badgeClass += " private";
+
+                    const qualityBadge = p.quality_score ? getQualityBadge(p.quality_score.score) : '';
+                    const isTask = p.type === 'task' || p.type === 'issue';
+                    const isOpen = isTask && p.metadata?.task_status !== 'resolved';
+
                     return `
-                        <div class="pheromone-line ${isProcessed ? 'processed' : ''}">
-                            <div class="${badgeClass}">${p.type}${privateHint}</div>
-                            <div class="pheromone-content">${p.content}</div>
+                        <div class="pheromone-line">
+                            <div class="${badgeClass}">${p.type}</div>
+                            <div class="pheromone-content">
+                                ${p.content}
+                                ${qualityBadge}
+                            </div>
                             <div>
                                 <span class="pheromone-status ${statusClass}">${statusText}</span>
                                 ${p.judgment_status === "pending" && p.type === "weekly_digest" ? `
-                                    <button class="approve-btn" onclick="approve('${p.id}')" style="margin-left:10px;padding:4px 12px;font-size:12px;background:#22c55e;color:#000;border:none;border-radius:4px;cursor:pointer">批准</button>
-                                    <button class="feedback-btn useful" onclick="giveFeedback('${p.id}', 'useful')" title="有用">✓</button>
-                                    <button class="feedback-btn unclear" onclick="giveFeedback('${p.id}', 'unclear')" title="不理解">?</button>
+                                    <button onclick="approve('${p.id}')" class="btn-small" style="margin-left:8px;background:#22c55e;color:#000;border:none;border-radius:4px;cursor:pointer">批准</button>
+                                    <button onclick="giveFeedback('${p.id}', 'useful')" class="btn-small" style="background:#22c55e;color:#000;border:none;border-radius:4px;cursor:pointer">✓</button>
+                                    <button onclick="giveFeedback('${p.id}', 'unclear')" class="btn-small" style="background:#f59e0b;color:#000;border:none;border-radius:4px;cursor:pointer">?</button>
+                                ` : ''}
+                                ${isOpen ? `
+                                    <button onclick="resolveTask('${p.id}')" class="btn-small btn-resolve" style="margin-left:8px;border:none;border-radius:4px;cursor:pointer">解决</button>
                                 ` : ''}
                             </div>
                         </div>
                     `;
                 }).join("");
             }
-
-            await loadLearning();
         }
 
         async function loadProfiles() {
@@ -957,15 +1099,9 @@ def index():
             grid.innerHTML = Object.entries(data).map(([id, profile]) => {
                 const cardClass = profile.role === "AI Agent" ? "agent" : "human";
                 const avatar = profile.name[0];
-                const criteria = (profile.judgment_criteria || []).map(c =>
-                    `<span class="profile-tag criteria">${c}</span>`
-                ).join("");
-                const peers = (profile.peer_eps || []).map(p =>
-                    `<span class="profile-tag peer">${p}</span>`
-                ).join("");
-                const learned = (profile.learned_patterns || []).map(l =>
-                    `<span class="profile-tag learned">${l.pattern} (${l.count})</span>`
-                ).join("");
+                const criteria = (profile.judgment_criteria || []).map(c => `<span class="profile-tag criteria">${c}</span>`).join("");
+                const peers = (profile.peer_eps || []).map(p => `<span class="profile-tag peer">${p}</span>`).join("");
+                const learned = (profile.learned_patterns || []).map(l => `<span class="profile-tag learned">${l.pattern} (${l.count})</span>`).join("");
                 return `
                     <div class="profile-card ${cardClass}">
                         <div class="profile-header">
@@ -985,11 +1121,11 @@ def index():
                             ${criteria || "<span class='profile-tag'>无</span>"}
                         </div>
                         <div class="profile-section">
-                            <div class="profile-section-title">已学到的 Pattern</div>
+                            <div class="profile-section-title">已学到的</div>
                             ${learned || "<span class='profile-tag'>暂无</span>"}
                         </div>
                         <div class="profile-section">
-                            <div class="profile-section-title">需要对齐的 EP</div>
+                            <div class="profile-section-title">需要对齐</div>
                             ${peers || "<span class='profile-tag'>无</span>"}
                         </div>
                     </div>
@@ -999,14 +1135,10 @@ def index():
 
         async function resetDemo() {
             await fetch("/api/reset", {method: "POST"});
-            await refresh();
-            await loadProfiles();
-            await loadLearning();
+            await Promise.all([refresh(), loadProfiles(), loadLearning()]);
         }
 
-        refresh();
-        loadProfiles();
-        loadLearning();
+        Promise.all([refresh(), loadProfiles(), loadLearning()]);
     </script>
 </body>
 </html>
