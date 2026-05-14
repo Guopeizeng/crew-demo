@@ -4,7 +4,9 @@
 
 ---
 
-## 场景
+## 双场景
+
+### 场景一：层级汇报（周报聚合）
 
 ```
 增 ──── 周报 ────→ Boss Agent
@@ -19,11 +21,28 @@
 ```
 
 > 员工提交周报 → Boss Agent 自动汇总 → 分发给老板和HR审批
-> Agent 发现问题时主动创建 Task
+
+### 场景二：单人调度多 Agent（并行协作）
+
+```
+增（发起任务）
+   │
+   ├──→ Boss Agent（任务分解）
+   │         │
+   │         ├──→ 浩（技术评审）──→ 批准/退回
+   │         │
+   │         └──→ HR（资源确认）──→ 确认/冲突
+   │              │
+   │              └──────┬──────────────┘
+   │                     ↓
+   └─────── 最终汇总到 增（收总结果）
+```
+
+> 增发起任务 → Boss Agent 分解分发 → 浩和HR并行评审 → 两者通过后汇总报告给增
 
 ---
 
-## 安全协议（v1.2）
+## 安全协议（v1.3）
 
 | 漏洞 | 协议 | 状态 |
 |------|------|------|
@@ -61,7 +80,7 @@ open http://localhost:5200
 | 字段 | 说明 |
 |------|------|
 | `id` | 唯一标识 |
-| `type` | weekly_report / weekly_digest / approval / task / issue / summary |
+| `type` | weekly_report / weekly_digest / approval / task / issue / summary / task_dispatch / tech_review / resource_confirm / final_report |
 | `sender` | 发送者 EP（强制从 X-Agent-ID 头读取） |
 | `targets` | 目标 EP 列表 |
 | `content` | 信息内容 |
@@ -119,6 +138,14 @@ GET /api/chain/<id>
 | `/api/agents/profiles` | GET | 获取所有 Agent Profile |
 | `/api/agents/<id>/create_task` | POST | Agent 主动创建 Task（强校验） |
 
+### 场景二：单人调度多 Agent
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/multi/dispatch` | POST | 增发起任务分发，Boss Agent 自动分解 |
+| `/api/multi/respond` | POST | 浩/HR 响应评审（批准/退回） |
+| `/api/multi/pending` | GET | 获取当前待响应的评审任务 |
+
 ### 创建周报
 
 ```bash
@@ -144,6 +171,18 @@ curl -X POST http://localhost:5200/api/agents/boss_agent/create_task \
     "task_type": "issue",
     "priority": "high",
     "targets": ["manager_peng"]
+  }'
+```
+
+### 场景二：任务分发
+
+```bash
+curl -X POST http://localhost:5200/api/multi/dispatch \
+  -H "Content-Type: application/json" \
+  -H "X-Agent-ID: employee_zeng" \
+  -d '{
+    "task_name": "开发新功能",
+    "content": "需要开发用户登录模块，包括前端、后端和数据库设计"
   }'
 ```
 
