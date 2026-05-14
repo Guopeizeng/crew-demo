@@ -1,8 +1,10 @@
 """
 Crew Demo - 周报聚合场景
-最小可演示版本 v0.2
+最小可演示版本 v0.3
 
-新增：visibility 字段（public | private_to_sender | private_to_target | private_to_group）
+新增：
+- visibility 字段（public | private_to_sender | private_to_target | private_to_group）
+- Agent Profile（借鉴 AgentBridge 的主人认知 Profile）
 
 run: python src/app.py
 """
@@ -11,6 +13,70 @@ from datetime import datetime
 import uuid
 
 app = Flask(__name__)
+
+# ============ Agent Profile（借鉴 AgentBridge） ============
+
+class AgentProfile:
+    """Agent 的认知 Profile——让 Agent 知道自己是谁、该以什么角度响应"""
+    def __init__(self, agent_id, name, ep, role, judgment_criteria=None, peer_eps=None, specialty=None):
+        self.agent_id = agent_id
+        self.name = name
+        self.ep = ep
+        self.role = role
+        self.judgment_criteria = judgment_criteria or []  # 判断标准列表
+        self.peer_eps = peer_eps or []  # 需要对齐的 EP 列表
+        self.specialty = specialty or ""  # 专长
+
+    def to_dict(self):
+        return {
+            "agent_id": self.agent_id,
+            "name": self.name,
+            "ep": self.ep,
+            "role": self.role,
+            "judgment_criteria": self.judgment_criteria,
+            "peer_eps": self.peer_eps,
+            "specialty": self.specialty
+        }
+
+# 预定义的 Agent Profiles（借鉴 AgentBridge 的"主人认知同步"）
+AGENT_PROFILES = {
+    "employee_zeng": AgentProfile(
+        agent_id="employee_zeng",
+        name="增",
+        ep="EP001",
+        role="员工",
+        specialty="用户研究、产品设计",
+        judgment_criteria=["需求是否真实", "用户是否需要"],
+        peer_eps=["EP002", "EP003"]
+    ),
+    "boss_agent": AgentProfile(
+        agent_id="boss_agent",
+        name="Boss Agent",
+        ep="EP002",
+        role="AI Agent",
+        specialty="团队协调、资源调配",
+        judgment_criteria=["是否符合团队目标", "优先级是否合理", "资源是否够用"],
+        peer_eps=["EP001", "EP003", "EP004"]
+    ),
+    "manager_peng": AgentProfile(
+        agent_id="manager_peng",
+        name="彭老板",
+        ep="EP003",
+        role="老板",
+        specialty="战略决策、团队管理",
+        judgment_criteria=["是否对公司有利", "风险是否可控", "ROI 是否合理"],
+        peer_eps=["EP002"]
+    ),
+    "hr_li": AgentProfile(
+        agent_id="hr_li",
+        name="李HR",
+        ep="EP004",
+        role="HR",
+        specialty="人力资源、政策合规",
+        judgment_criteria=["是否合规", "是否公平", "是否可持续"],
+        peer_eps=["EP002", "EP003"]
+    ),
+}
 
 # ============ 数据模型 ============
 
@@ -76,6 +142,33 @@ pending_responses = {}  # 用于模拟 Boss Agent 的响应
 def get_participants():
     """获取所有参与者"""
     return jsonify(PARTICIPANTS)
+
+@app.route("/api/agents/profiles", methods=["GET"])
+def get_agent_profiles():
+    """获取所有 Agent Profiles"""
+    return jsonify({k: v.to_dict() for k, v in AGENT_PROFILES.items()})
+
+@app.route("/api/agents/profiles/<agent_id>", methods=["GET"])
+def get_agent_profile(agent_id):
+    """获取单个 Agent Profile"""
+    if agent_id in AGENT_PROFILES:
+        return jsonify(AGENT_PROFILES[agent_id].to_dict())
+    return jsonify({"error": "not found"}), 404
+
+@app.route("/api/agents/profiles/<agent_id>", methods=["PUT"])
+def update_agent_profile(agent_id):
+    """更新 Agent Profile"""
+    if agent_id not in AGENT_PROFILES:
+        return jsonify({"error": "not found"}), 404
+    data = request.json
+    profile = AGENT_PROFILES[agent_id]
+    if "judgment_criteria" in data:
+        profile.judgment_criteria = data["judgment_criteria"]
+    if "peer_eps" in data:
+        profile.peer_eps = data["peer_eps"]
+    if "specialty" in data:
+        profile.specialty = data["specialty"]
+    return jsonify(profile.to_dict())
 
 @app.route("/api/pheromones", methods=["GET"])
 def get_pheromones():
@@ -166,13 +259,21 @@ def reset():
 
 def handle_weekly_report(p):
     """处理周报：触发 Boss Agent 生成汇总"""
+    # 借鉴 AgentBridge：从 Boss Agent 的 Profile 获取判断标准
+    boss_profile = AGENT_PROFILES.get("boss_agent")
+
     digest = Pheromone(
         type="weekly_digest",
         sender="boss_agent",
         targets=["manager_peng", "hr_li"],
         content=generate_digest_content(),
         parent_pheromone_id=p.id,
-        metadata={"source_report_id": p.id}
+        metadata={
+            "source_report_id": p.id,
+            "judging_agent": "boss_agent",
+            "judgment_criteria": boss_profile.judgment_criteria if boss_profile else [],
+            "peer_eps": boss_profile.peer_eps if boss_profile else []
+        }
     )
     pheromones.append(digest)
     pending_responses[digest.id] = digest
@@ -462,6 +563,63 @@ def index():
         }
         .viewer-btn:hover { border-color: #6366f1; color: #6366f1; }
         .viewer-btn.active { background: #6366f1; border-color: #6366f1; color: #fff; }
+
+        /* Agent Profile */
+        .profile-area {
+            background: #111118;
+            border: 1px solid #222;
+            border-radius: 12px;
+            padding: 30px;
+            margin-bottom: 30px;
+        }
+        .profile-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+            gap: 15px;
+        }
+        .profile-card {
+            background: #16161e;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 15px;
+        }
+        .profile-card.agent { border-left: 3px solid #6366f1; }
+        .profile-card.human { border-left: 3px solid #22c55e; }
+        .profile-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        .profile-avatar {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            background: #1a1a24;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px;
+        }
+        .profile-info { flex: 1; }
+        .profile-name { font-weight: 600; color: #fff; font-size: 14px; }
+        .profile-role { font-size: 12px; color: #666; }
+        .profile-ep { font-size: 11px; color: #555; font-family: monospace; }
+        .profile-section { margin-top: 10px; }
+        .profile-section-title { font-size: 11px; color: #555; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+        .profile-tag {
+            display: inline-block;
+            background: #1a1a24;
+            border: 1px solid #333;
+            border-radius: 4px;
+            padding: 3px 8px;
+            font-size: 12px;
+            color: #888;
+            margin: 2px;
+        }
+        .profile-tag.criteria { border-color: #6366f1; color: #6366f1; }
+        .profile-tag.peer { border-color: #22c55e; color: #22c55e; }
+        .profile-tag.specialty { border-color: #f59e0b; color: #f59e0b; }
     </style>
 </head>
 <body>
@@ -486,6 +644,14 @@ def index():
             <div class="status-card">
                 <div class="status-number" id="done-count">0</div>
                 <div class="status-label">已完成</div>
+            </div>
+        </div>
+
+        <!-- Agent Profile 展示 -->
+        <div class="profile-area">
+            <div class="flow-title">Agent Profile · 认知 Profile（借鉴 AgentBridge）</div>
+            <div class="profile-grid" id="profile-grid">
+                <div class="empty-state">加载中...</div>
             </div>
         </div>
 
@@ -662,7 +828,48 @@ def index():
             await refresh();
         }
 
+        async function loadProfiles() {
+            const res = await fetch("/api/agents/profiles");
+            const data = await res.json();
+            const grid = document.getElementById("profile-grid");
+            grid.innerHTML = Object.entries(data).map(([id, profile]) => {
+                const cardClass = profile.role === "AI Agent" ? "agent" : "human";
+                const avatar = profile.name[0];
+                const criteria = (profile.judgment_criteria || []).map(c =>
+                    `<span class="profile-tag criteria">${c}</span>`
+                ).join("");
+                const peers = (profile.peer_eps || []).map(p =>
+                    `<span class="profile-tag peer">${p}</span>`
+                ).join("");
+                return `
+                    <div class="profile-card ${cardClass}">
+                        <div class="profile-header">
+                            <div class="profile-avatar">${avatar}</div>
+                            <div class="profile-info">
+                                <div class="profile-name">${profile.name}</div>
+                                <div class="profile-role">${profile.role}</div>
+                                <div class="profile-ep">${profile.ep}</div>
+                            </div>
+                        </div>
+                        <div class="profile-section">
+                            <div class="profile-section-title">专长</div>
+                            <span class="profile-tag specialty">${profile.specialty || "无"}</span>
+                        </div>
+                        <div class="profile-section">
+                            <div class="profile-section-title">判断标准</div>
+                            ${criteria || "<span class='profile-tag'>无</span>"}
+                        </div>
+                        <div class="profile-section">
+                            <div class="profile-section-title">需要对齐的 EP</div>
+                            ${peers || "<span class='profile-tag'>无</span>"}
+                        </div>
+                    </div>
+                `;
+            }).join("");
+        }
+
         refresh();
+        loadProfiles();
     </script>
 </body>
 </html>
