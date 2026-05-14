@@ -23,6 +23,19 @@
 
 ---
 
+## 安全协议（v1.2）
+
+| 漏洞 | 协议 | 状态 |
+|------|------|------|
+| Pheromone Storm | hop_count ≥ MAX_HOPS → 强制 escalate | ✅ |
+| 僵尸信息素 | 状态机 + DLQ（pending>600s） | ✅ |
+| 上下文雪崩 | 链路压缩（chain>5 生成摘要） | ✅ |
+| 身份伪造 | X-Agent-ID 强制验证 | ✅ |
+| 薛定谔 JSON | 强类型校验（Enum + lowercasing） | ✅ |
+| 并发双花 | 全局写锁（threading.Lock） | ✅ |
+
+---
+
 ## 快速启动
 
 ```bash
@@ -48,12 +61,13 @@ open http://localhost:5200
 | 字段 | 说明 |
 |------|------|
 | `id` | 唯一标识 |
-| `type` | weekly_report / weekly_digest / approval / task / issue |
-| `sender` | 发送者 EP |
+| `type` | weekly_report / weekly_digest / approval / task / issue / summary |
+| `sender` | 发送者 EP（强制从 X-Agent-ID 头读取） |
 | `targets` | 目标 EP 列表 |
 | `content` | 信息内容 |
 | `parent_pheromone_id` | 父节点，形成链路 |
-| `judgment_status` | pending → approved |
+| `status` | pending → processing → approved / rejected / timeout / failed |
+| `hop_count` | 跳转次数（防 Storm，上限 5） |
 
 ### Agent Profile
 
@@ -64,6 +78,7 @@ open http://localhost:5200
   "agent_id": "boss_agent",
   "name": "Boss Agent",
   "role": "AI Agent",
+  "ep": "EP002",
   "specialty": "团队协调、资源调配",
   "judgment_criteria": [
     "是否符合团队目标",
@@ -91,9 +106,10 @@ GET /api/chain/<id>
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/api/pheromones` | GET | 获取所有信息素 |
-| `/api/pheromones` | POST | 创建信息素 |
+| `/api/pheromones` | GET | 获取所有信息素（含 DLQ 扫描） |
+| `/api/pheromones` | POST | 创建信息素（原子锁保护） |
 | `/api/chain/<id>` | GET | 链路追溯 |
+| `/api/dlq` | GET | 查看死信队列 |
 | `/api/reset` | POST | 重置数据 |
 
 ### Agent 操作
@@ -101,13 +117,14 @@ GET /api/chain/<id>
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/api/agents/profiles` | GET | 获取所有 Agent Profile |
-| `/api/agents/<id>/create_task` | POST | Agent 主动创建 Task |
+| `/api/agents/<id>/create_task` | POST | Agent 主动创建 Task（强校验） |
 
 ### 创建周报
 
 ```bash
 curl -X POST http://localhost:5200/api/pheromones \
   -H "Content-Type: application/json" \
+  -H "X-Agent-ID: employee_zeng" \
   -d '{
     "type": "weekly_report",
     "sender": "employee_zeng",
@@ -121,6 +138,7 @@ curl -X POST http://localhost:5200/api/pheromones \
 ```bash
 curl -X POST http://localhost:5200/api/agents/boss_agent/create_task \
   -H "Content-Type: application/json" \
+  -H "X-Agent-ID: boss_agent" \
   -d '{
     "content": "周报提交率偏低，建议提醒未提交人员",
     "task_type": "issue",
@@ -131,6 +149,18 @@ curl -X POST http://localhost:5200/api/agents/boss_agent/create_task \
 
 ---
 
+## Schema 校验（漏洞四）
+
+`/api/agents/<id>/create_task` 对 payload 有强类型要求：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `task_type` | `task` \| `issue` | 必填，大小写敏感 |
+| `priority` | `low` \| `medium` \| `high` | 必填，大小写不敏感（自动规范化） |
+| `content` | string | 必填，不能为空 |
+
+---
+
 ## 技术栈
 
 | 层级 | 技术 |
@@ -138,6 +168,7 @@ curl -X POST http://localhost:5200/api/agents/boss_agent/create_task \
 | 后端 | Python 3.14+ / Flask |
 | 前端 | Vanilla JS（零依赖） |
 | 存储 | 内存（可扩展 SQLite） |
+| 校验 | Enum + lowercasing（无 Pydantic 依赖） |
 
 ---
 
