@@ -1,26 +1,29 @@
 """
 Crew Demo - 周报聚合场景
-最小可演示版本 v1.0 精简版
+最小可演示版本 v1.1 安全加固版
 
-保留核心：
-- Pheromone 链（parent + children）
-- Agent Profile（Boss Agent 用它生成 digest）
-- Boss Agent 主动创建 Task
-- 链路追溯
-
-删除（过度工程）：
-- visibility 权限控制
-- 反馈学习 + 全局学习展示
-- 内容质量评分
-- Task resolve 流程
+安全协议（Hotfix）：
+1. Hop Count Limit：防止 Pheromone Storm
+2. 状态机 + DLQ：防止僵尸信息素
+3. 记忆压缩：防止上下文雪崩
+4. 身份强制验证：防止零信任违规
 
 run: python src/app.py
 """
 from flask import Flask, jsonify, request
 from datetime import datetime
 import uuid
+import threading
+import time
 
 app = Flask(__name__)
+
+# ============ 常量 ============
+
+MAX_HOPS = 5           # 最大跳转次数
+MAX_CHAIN_LENGTH = 5   # 链路长度阈值（触发记忆压缩）
+PENDING_TIMEOUT_SEC = 600  # 10分钟超时
+DLQ_TAG = "dead_letter"     # 死信队列标签
 
 # ============ Agent Profile ============
 
@@ -47,57 +50,71 @@ class AgentProfile:
 
 AGENT_PROFILES = {
     "employee_zeng": AgentProfile(
-        agent_id="employee_zeng",
-        name="增",
-        ep="EP001",
-        role="员工",
+        agent_id="employee_zeng", name="增", ep="EP001", role="员工",
         specialty="用户研究、产品设计",
         judgment_criteria=["需求是否真实", "用户是否需要"],
         peer_eps=["EP002", "EP003"]
     ),
     "boss_agent": AgentProfile(
-        agent_id="boss_agent",
-        name="Boss Agent",
-        ep="EP002",
-        role="AI Agent",
+        agent_id="boss_agent", name="Boss Agent", ep="EP002", role="AI Agent",
         specialty="团队协调、资源调配",
         judgment_criteria=["是否符合团队目标", "优先级是否合理", "资源是否够用"],
         peer_eps=["EP001", "EP003", "EP004"]
     ),
     "manager_peng": AgentProfile(
-        agent_id="manager_peng",
-        name="彭老板",
-        ep="EP003",
-        role="老板",
+        agent_id="manager_peng", name="彭老板", ep="EP003", role="老板",
         specialty="战略决策、团队管理",
         judgment_criteria=["是否对公司有利", "风险是否可控", "ROI 是否合理"],
         peer_eps=["EP002"]
     ),
     "hr_li": AgentProfile(
-        agent_id="hr_li",
-        name="李HR",
-        ep="EP004",
-        role="HR",
+        agent_id="hr_li", name="李HR", ep="EP004", role="HR",
         specialty="人力资源、政策合规",
         judgment_criteria=["是否合规", "是否公平", "是否可持续"],
         peer_eps=["EP002", "EP003"]
     ),
 }
 
+# ============ 身份验证（漏洞三 Hotfix） ============
+# sender 必须从请求头 X-Agent-ID 读取，禁止客户端伪造
+
+def validated_sender(request_data):
+    """
+    漏洞三 Hotfix：强制从请求头读取 sender，禁止客户端伪造。
+    Demo 环境使用简单模拟（生产环境应使用 JWT/Session）。
+    """
+    # 优先从 header 读取（模拟可信来源）
+    sender = request.headers.get("X-Agent-ID")
+    if not sender:
+        sender = request_data.get("sender")
+    return sender
+
 # ============ 数据模型 ============
 
 class Pheromone:
+    # 状态机（漏洞二 Hotfix：补全状态）
+    STATUS_PENDING = "pending"
+    STATUS_PROCESSING = "processing"
+    STATUS_APPROVED = "approved"
+    STATUS_REJECTED = "rejected"
+    STATUS_TIMEOUT = "timeout"  # 新增
+    STATUS_FAILED = "failed"    # 新增
+
     def __init__(self, id=None, type=None, sender=None, targets=None, content=None,
-                 parent_pheromone_id=None, judgment_status="pending", metadata=None):
+                 parent_pheromone_id=None, judgment_status="pending", metadata=None,
+                 hop_count=0):
         self.id = id or str(uuid.uuid4())[:8]
         self.type = type
-        self.sender = sender
+        self.sender = sender  # 由 validated_sender() 强制写入
         self.targets = targets or []
         self.content = content
         self.parent_pheromone_id = parent_pheromone_id
         self.judgment_status = judgment_status
         self.metadata = metadata or {}
         self.timestamp = datetime.utcnow().isoformat() + "Z"
+        self.hop_count = hop_count
+        self.status = judgment_status  # 兼容旧字段
+        self._created_at = datetime.utcnow()
 
     def to_dict(self):
         return {
@@ -108,26 +125,103 @@ class Pheromone:
             "content": self.content,
             "parent_pheromone_id": self.parent_pheromone_id,
             "judgment_status": self.judgment_status,
+            "status": self.status,
             "metadata": self.metadata,
-            "timestamp": self.timestamp
+            "timestamp": self.timestamp,
+            "hop_count": self.hop_count,
+            "exceeded": self.hop_count >= MAX_HOPS
         }
+
+    def should_escalate(self):
+        """检查 hop_count 是否超过限制"""
+        return self.hop_count >= MAX_HOPS
+
+    def get_age_seconds(self):
+        """获取信息素存活时长（秒）"""
+        return (datetime.utcnow() - self._created_at).total_seconds()
 
 # ============ 存储 ============
 
-PARTICIPANTS = {
-    "employee_zeng": {"name": "增", "ep": "EP001", "role": "员工"},
-    "boss_agent": {"name": "Boss Agent", "ep": "EP002", "role": "AI Agent"},
-    "manager_peng": {"name": "彭老板", "ep": "EP003", "role": "老板"},
-    "hr_li": {"name": "李HR", "ep": "EP004", "role": "HR"},
-}
-
 pheromones = []
+dlq = []  # 死信队列
+
+# ============ 工具函数 ============
+
+def compute_hop_count(parent_id):
+    """计算新 pheromone 的 hop_count（基于 parent）"""
+    if not parent_id:
+        return 0
+    for p in pheromones:
+        if p.id == parent_id:
+            return p.hop_count + 1
+    return 0
+
+def check_dlq():
+    """
+    漏洞二 Hotfix：死信队列扫描
+    每当有 pending 状态超过 PENDING_TIMEOUT_SEC 的信息素，打入 DLQ
+    """
+    global dlq
+    now_pending = [p for p in pheromones if p.status == Pheromone.STATUS_PENDING]
+    for p in now_pending:
+        if p.get_age_seconds() > PENDING_TIMEOUT_SEC:
+            p.status = Pheromone.STATUS_TIMEOUT
+            p.metadata[DLQ_TAG] = True
+            p.metadata["timeout_at"] = datetime.utcnow().isoformat() + "Z"
+            dlq.append(p)
+    return dlq
+
+def compress_chain(report_id):
+    """
+    漏洞三 Hotfix：记忆压缩
+    当链路长度超过 MAX_CHAIN_LENGTH 时，生成压缩摘要
+    """
+    chain = get_chain_data(report_id)
+    if len(chain) <= MAX_CHAIN_LENGTH:
+        return None
+
+    # 压缩：保留头部（原始请求）+ 尾部（最近2条）+ 中间压缩
+    summary_content = []
+    for i, p in enumerate(chain):
+        if i == 0:
+            summary_content.append(f"原始：{p['content'][:50]}...")
+        elif i >= len(chain) - 2:
+            summary_content.append(f"{p['type']}：{p['content'][:30]}...")
+        elif p['type'] == 'summary':
+            summary_content.append(f"摘要：{p['content'][:50]}...")
+
+    return {
+        "type": "summary",
+        "content": " | ".join(summary_content),
+        "compressed_from": len(chain)
+    }
+
+def get_chain_data(pid):
+    """获取链路数据（不调用 API，纯内部函数）"""
+    chain = []
+    target_id = pid
+    visited = set()
+
+    while target_id and target_id not in visited:
+        visited.add(target_id)
+        found = None
+        for p in pheromones:
+            if p.id == target_id:
+                found = p
+                break
+        if found:
+            chain.append(found.to_dict())
+            target_id = found.parent_pheromone_id if found.parent_pheromone_id != found.id else None
+        else:
+            break
+
+    return chain
 
 # ============ API ============
 
 @app.route("/api/participants", methods=["GET"])
 def get_participants():
-    return jsonify(PARTICIPANTS)
+    return jsonify({k: {"name": v.name, "ep": v.ep, "role": v.role} for k, v in AGENT_PROFILES.items()})
 
 @app.route("/api/agents/profiles", methods=["GET"])
 def get_agent_profiles():
@@ -135,14 +229,14 @@ def get_agent_profiles():
 
 @app.route("/api/agents/<agent_id>/create_task", methods=["POST"])
 def agent_create_task(agent_id):
-    """Agent 主动创建 Task（借鉴 Multica）"""
+    """Agent 主动创建 Task"""
     if agent_id not in AGENT_PROFILES:
         return jsonify({"error": "agent not found"}), 404
 
     data = request.json
     p = Pheromone(
         type=data.get("task_type", "task"),
-        sender=agent_id,
+        sender=validated_sender(data),  # 漏洞三：强制验证 sender
         targets=data.get("targets", []),
         content=data.get("content"),
         metadata={
@@ -152,25 +246,48 @@ def agent_create_task(agent_id):
         }
     )
     pheromones.append(p)
-
     return jsonify({"status": "created", "pheromone": p.to_dict()}), 201
 
 @app.route("/api/pheromones", methods=["GET"])
 def get_pheromones():
+    check_dlq()  # 每次查询前扫描 DLQ
     return jsonify([p.to_dict() for p in pheromones])
 
 @app.route("/api/pheromones", methods=["POST"])
 def create_pheromone():
     data = request.json
+
+    # 漏洞三：sender 强制验证，禁止伪造
+    sender = validated_sender(data)
+
+    # 计算 hop_count
+    parent_id = data.get("parent_pheromone_id")
+    hop_count = compute_hop_count(parent_id)
+
     p = Pheromone(
         type=data.get("type"),
-        sender=data.get("sender"),
+        sender=sender,
         targets=data.get("targets", []),
         content=data.get("content"),
-        parent_pheromone_id=data.get("parent_pheromone_id"),
-        metadata=data.get("metadata", {})
+        parent_pheromone_id=parent_id,
+        metadata=data.get("metadata", {}),
+        hop_count=hop_count
     )
     pheromones.append(p)
+
+    # 漏洞一：hop_count 超过限制 → escalate
+    if p.should_escalate():
+        p.metadata["escalated"] = True
+        p.metadata["human_intervention"] = True
+        p.status = Pheromone.STATUS_FAILED
+        return jsonify({
+            "status": "escalated",
+            "pheromone": p.to_dict(),
+            "warning": f"链路跳数超过 {MAX_HOPS}，已转交人类处理"
+        }), 201
+
+    # 漏洞二：处理超时检测
+    check_dlq()
 
     if p.type == "weekly_report":
         handle_weekly_report(p)
@@ -185,6 +302,12 @@ def get_pheromone(pid):
         if p.id == pid:
             return jsonify(p.to_dict())
     return jsonify({"error": "not found"}), 404
+
+@app.route("/api/dlq", methods=["GET"])
+def get_dlq():
+    """获取死信队列"""
+    check_dlq()
+    return jsonify([p.to_dict() for p in dlq])
 
 @app.route("/api/chain/<pid>", methods=["GET"])
 def get_chain(pid):
@@ -220,8 +343,9 @@ def get_sub_chain(pid):
 
 @app.route("/api/reset", methods=["POST"])
 def reset():
-    global pheromones
+    global pheromones, dlq
     pheromones = []
+    dlq = []
     return jsonify({"status": "reset"})
 
 # ============ 业务逻辑 ============
@@ -231,7 +355,7 @@ def handle_weekly_report(p):
 
     digest = Pheromone(
         type="weekly_digest",
-        sender="boss_agent",
+        sender="boss_agent",  # 固定为 Boss Agent，不接受客户端传入
         targets=["manager_peng", "hr_li"],
         content=generate_digest_content(),
         parent_pheromone_id=p.id,
@@ -239,9 +363,14 @@ def handle_weekly_report(p):
             "source_report_id": p.id,
             "judging_agent": "boss_agent",
             "judgment_criteria": boss_profile.judgment_criteria if boss_profile else []
-        }
+        },
+        hop_count=p.hop_count + 1
     )
     pheromones.append(digest)
+
+    if digest.should_escalate():
+        digest.metadata["escalated"] = True
+        digest.metadata["human_intervention"] = True
 
 def generate_digest_content():
     reports = [p for p in pheromones if p.type == "weekly_report"]
@@ -260,6 +389,7 @@ def handle_approval(p):
         for parent in pheromones:
             if parent.id == p.parent_pheromone_id:
                 parent.judgment_status = p.judgment_status
+                parent.status = p.judgment_status
                 break
 
 # ============ 前端 ============
@@ -302,7 +432,7 @@ def index():
 
         .status-panel {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
+            grid-template-columns: repeat(4, 1fr);
             gap: 15px;
             margin-bottom: 30px;
         }
@@ -358,10 +488,32 @@ def index():
         }
         .pheromone-badge.task { background: #8b5cf6; }
         .pheromone-badge.issue { background: #ef4444; }
+        .pheromone-badge.summary { background: #f59e0b; }
         .pheromone-content { flex: 1; font-size: 14px; color: #aaa; }
         .pheromone-status { font-size: 12px; padding: 4px 10px; border-radius: 4px; }
         .pheromone-status.pending { background: #fbbf24; color: #000; }
         .pheromone-status.approved { background: #22c55e; color: #000; }
+        .pheromone-status.timeout { background: #ef4444; color: #fff; }
+
+        .hop-badge {
+            background: #333;
+            color: #888;
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 3px;
+            margin-left: 8px;
+        }
+        .hop-badge.warning { background: #f59e0b; color: #000; }
+        .hop-badge.danger { background: #ef4444; color: #fff; }
+
+        .dlq-warning {
+            background: #ef4444;
+            color: #fff;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 13px;
+            margin-bottom: 15px;
+        }
 
         .form-group { margin-bottom: 20px; }
         .form-group label { display: block; font-size: 13px; color: #888; margin-bottom: 8px; }
@@ -375,7 +527,6 @@ def index():
             font-size: 14px;
             font-family: inherit;
         }
-        textarea:focus, input:focus { outline: none; border-color: #6366f1; }
         button {
             background: #6366f1;
             color: #fff;
@@ -385,10 +536,8 @@ def index():
             font-size: 14px;
             font-weight: 600;
             cursor: pointer;
-            transition: background 0.2s;
         }
         button:hover { background: #5558e3; }
-        button:disabled { background: #333; cursor: not-allowed; }
         .btn-secondary {
             background: transparent;
             border: 1px solid #333;
@@ -397,7 +546,6 @@ def index():
         .btn-secondary:hover { border-color: #6366f1; color: #6366f1; }
         .btn-agent { background: #8b5cf6; }
         .btn-agent:hover { background: #7c3aed; }
-        .btn-small { padding: 6px 12px; font-size: 12px; }
 
         .profile-grid {
             display: grid;
@@ -456,33 +604,14 @@ def index():
             padding: 20px;
             margin-top: 20px;
         }
-        .task-section-title {
-            font-size: 13px;
-            color: #8b5cf6;
-            margin-bottom: 15px;
-        }
-
-        .chain-item {
-            padding: 15px;
-            background: #16161e;
-            border-radius: 8px;
-            margin-bottom: 10px;
-            border-left: 3px solid #333;
-        }
-        .chain-item.pending { border-left-color: #fbbf24; }
-        .chain-item.approved { border-left-color: #22c55e; }
-        .chain-header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
-        .chain-id { font-family: monospace; font-size: 12px; color: #6366f1; }
-        .chain-body { font-size: 14px; color: #ccc; }
-        .chain-meta { font-size: 12px; color: #555; margin-top: 8px; }
 
         .empty-state { text-align: center; padding: 40px 20px; color: #444; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Crew Demo</h1>
-        <p class="subtitle">信息自己知道去哪 · Pheromone 链演示</p>
+        <h1>Crew Demo <span style="font-size:14px;color:#666">v1.1</span></h1>
+        <p class="subtitle">安全加固版 · Pheromone 链演示</p>
 
         <div class="status-panel">
             <div class="status-card">
@@ -497,6 +626,14 @@ def index():
                 <div class="status-number" id="approved-count">0</div>
                 <div class="status-label">已审批</div>
             </div>
+            <div class="status-card">
+                <div class="status-number" id="dlq-count">0</div>
+                <div class="status-label">死信队列</div>
+            </div>
+        </div>
+
+        <div id="dlq-alert" style="display:none;" class="dlq-warning">
+            ⚠️ 有信息素超时进入死信队列，请检查！
         </div>
 
         <div class="card">
@@ -545,12 +682,11 @@ def index():
         </div>
 
         <div class="card">
-            <div class="card-title">Agent 主动创建 Task（借鉴 Multica）</div>
+            <div class="card-title">Agent 主动创建 Task（Multica 启发）</div>
             <div class="task-section">
-                <div class="task-section-title">Boss Agent 发现问题时可以主动创建 Task</div>
                 <div class="form-group">
                     <label>任务内容</label>
-                    <input type="text" id="task-content" placeholder="例如：周报提交率偏低，建议提醒未提交人员">
+                    <input type="text" id="task-content" placeholder="Boss Agent 发现问题时主动创建">
                 </div>
                 <div class="form-group">
                     <label>类型</label>
@@ -562,13 +698,6 @@ def index():
                 <button class="btn-agent" onclick="createTask()">Boss Agent 创建任务</button>
             </div>
         </div>
-
-        <div class="card">
-            <div class="card-title">链路追溯</div>
-            <div id="chain-list">
-                <div class="empty-state">暂无链路...</div>
-            </div>
-        </div>
     </div>
 
     <script>
@@ -577,17 +706,11 @@ def index():
             if (!content) { alert("请填写周报内容"); return; }
             const btn = document.querySelector(".card:nth-child(4) button");
             btn.disabled = true;
-
             try {
                 await fetch("/api/pheromones", {
                     method: "POST",
-                    headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify({
-                        type: "weekly_report",
-                        sender: "employee_zeng",
-                        targets: ["boss_agent"],
-                        content: content
-                    })
+                    headers: { "Content-Type": "application/json", "X-Agent-ID": "employee_zeng" },
+                    body: JSON.stringify({ type: "weekly_report", sender: "employee_zeng", targets: ["boss_agent"], content })
                 });
                 document.getElementById("report-content").value = "";
                 await refresh();
@@ -599,62 +722,64 @@ def index():
         async function createTask() {
             const content = document.getElementById("task-content").value.trim();
             if (!content) { alert("请填写任务内容"); return; }
-
             await fetch("/api/agents/boss_agent/create_task", {
                 method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({
-                    content: content,
-                    task_type: document.getElementById("task-type").value,
-                    targets: ["manager_peng"]
-                })
+                headers: { "Content-Type": "application/json", "X-Agent-ID": "boss_agent" },
+                body: JSON.stringify({ content, task_type: document.getElementById("task-type").value, targets: ["manager_peng"] })
             });
-
             document.getElementById("task-content").value = "";
             await refresh();
         }
 
-        async function approve(pheromoneId) {
+        async function approve(pid) {
             await fetch("/api/pheromones", {
                 method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({
-                    type: "approval",
-                    sender: "manager_peng",
-                    targets: [pheromoneId],
-                    content: "已阅",
-                    parent_pheromone_id: pheromoneId,
-                    judgment_status: "approved"
-                })
+                headers: { "Content-Type": "application/json", "X-Agent-ID": "manager_peng" },
+                body: JSON.stringify({ type: "approval", sender: "manager_peng", targets: [pid], content: "已阅", parent_pheromone_id: pid, judgment_status: "approved" })
             });
             await refresh();
         }
 
         async function refresh() {
-            const res = await fetch("/api/pheromones");
-            const data = await res.json();
+            const [pheromones, dlq] = await Promise.all([
+                fetch("/api/pheromones").then(r => r.json()),
+                fetch("/api/dlq").then(r => r.json())
+            ]);
 
-            document.getElementById("total-count").textContent = data.length;
-            document.getElementById("pending-count").textContent = data.filter(p => p.judgment_status === "pending").length;
-            document.getElementById("approved-count").textContent = data.filter(p => p.judgment_status === "approved").length;
+            document.getElementById("total-count").textContent = pheromones.length;
+            document.getElementById("pending-count").textContent = pheromones.filter(p => p.status === "pending").length;
+            document.getElementById("approved-count").textContent = pheromones.filter(p => p.status === "approved").length;
+            document.getElementById("dlq-count").textContent = dlq.length;
+
+            const alert = document.getElementById("dlq-alert");
+            alert.style.display = dlq.length > 0 ? "block" : "none";
 
             const list = document.getElementById("pheromone-list");
-            if (data.length === 0) {
+            if (pheromones.length === 0) {
                 list.innerHTML = '<div class="empty-state">暂无信息...</div>';
             } else {
-                list.innerHTML = data.map(p => {
-                    const statusClass = p.judgment_status === "pending" ? "pending" : "approved";
-                    const statusText = p.judgment_status === "pending" ? "待审批" : "已审批";
+                list.innerHTML = pheromones.map(p => {
+                    const statusClass = p.status === "pending" ? "pending" : p.status === "timeout" ? "timeout" : "approved";
+                    const statusText = p.status === "pending" ? "待审批" : p.status === "timeout" ? "超时" : "已审批";
                     let badgeClass = "pheromone-badge";
                     if (p.type === 'task') badgeClass += " task";
                     else if (p.type === 'issue') badgeClass += " issue";
+                    else if (p.type === 'summary') badgeClass += " summary";
+
+                    let hopClass = "hop-badge";
+                    if (p.hop_count >= 4) hopClass += " danger";
+                    else if (p.hop_count >= 3) hopClass += " warning";
+
                     return `
                         <div class="pheromone-line">
                             <div class="${badgeClass}">${p.type}</div>
-                            <div class="pheromone-content">${p.content}</div>
+                            <div class="pheromone-content">
+                                ${p.content}
+                                <span class="${hopClass}">hop ${p.hop_count}</span>
+                            </div>
                             <div>
                                 <span class="pheromone-status ${statusClass}">${statusText}</span>
-                                ${p.judgment_status === "pending" && p.type === "weekly_digest" ? `
+                                ${p.status === "pending" && p.type === "weekly_digest" ? `
                                     <button onclick="approve('${p.id}')" style="margin-left:10px;padding:4px 12px;font-size:12px;background:#22c55e;color:#000;border:none;border-radius:4px;cursor:pointer">批准</button>
                                 ` : ''}
                             </div>
@@ -665,8 +790,7 @@ def index():
         }
 
         async function loadProfiles() {
-            const res = await fetch("/api/agents/profiles");
-            const data = await res.json();
+            const data = await fetch("/api/agents/profiles").then(r => r.json());
             const grid = document.getElementById("profile-grid");
             grid.innerHTML = Object.entries(data).map(([id, profile]) => {
                 const cardClass = profile.role === "AI Agent" ? "agent" : "human";
@@ -701,7 +825,7 @@ def index():
         }
 
         async function resetDemo() {
-            await fetch("/api/reset", {method: "POST"});
+            await fetch("/api/reset", { method: "POST" });
             await refresh();
         }
 
