@@ -1,14 +1,17 @@
 """
 Crew Demo - 周报聚合场景
-最小可演示版本 v1.2 安全加固版
+最小可演示版本 v1.3 双场景版
+
+场景一：层级汇报（员工→Boss→老板/HR）
+场景二：单人调度（一人发起点，多 Agent 并行处理，结果汇总）
 
 安全协议（Hotfix）：
 1. Hop Count Limit：防止 Pheromone Storm
 2. 状态机 + DLQ：防止僵尸信息素
 3. 记忆压缩：防止上下文雪崩
 4. 身份强制验证：防止零信任违规
-5. 强类型校验：防止薛定谔 JSON（Schema Collapse）
-6. 原子操作锁：防止并发双花（Concurrency Collision）
+5. 强类型校验：防止薛定谔 JSON
+6. 原子操作锁：防止并发双花
 
 run: python src/app.py
 """
@@ -79,6 +82,13 @@ AGENT_PROFILES = {
         specialty="人力资源、政策合规",
         judgment_criteria=["是否合规", "是否公平", "是否可持续"],
         peer_eps=["EP002", "EP003"]
+    ),
+    # 场景二：单人调度多 Agent
+    "xiaomei": AgentProfile(
+        agent_id="xiaomei", name="浩", ep="EP005", role="AI Agent",
+        specialty="技术架构、代码评审",
+        judgment_criteria=["技术可行性", "代码质量", "性能影响"],
+        peer_eps=["EP001", "EP002", "EP004"]
     ),
 }
 
@@ -165,6 +175,11 @@ class PheromoneType(str, Enum):
     TASK = "task"
     ISSUE = "issue"
     SUMMARY = "summary"
+    # 场景二：单人调度多 Agent
+    TASK_DISPATCH = "task_dispatch"      # 任务分发（增→Boss）
+    TECH_REVIEW = "tech_review"          # 技术评审（Boss→浩）
+    RESOURCE_CONFIRM = "resource_confirm" # 资源确认（Boss→HR）
+    FINAL_REPORT = "final_report"        # 最终汇总（Boss→增）
 
 def validate_task_payload(data):
     """
@@ -466,6 +481,161 @@ def handle_approval(p):
                 parent.status = p.judgment_status
                 break
 
+# ============ 场景二：单人调度多 Agent ============
+
+@app.route("/api/multi/dispatch", methods=["POST"])
+def multi_dispatch():
+    """
+    场景二：增发起任务，Boss Agent 分解分发到浩（技术）和 HR（资源）
+    并行处理后 Boss Agent 汇总结果给增
+    """
+    data = request.json or {}
+    sender = validated_sender(data)
+
+    with _pheromone_lock:
+        # 1. 增发起任务分发
+        dispatch = Pheromone(
+            type="task_dispatch",
+            sender=sender,
+            targets=["boss_agent"],
+            content=data.get("content", "新功能开发任务"),
+            metadata={
+                "original_sender": sender,
+                "task_name": data.get("task_name", "未命名任务")
+            },
+            hop_count=0
+        )
+        pheromones.append(dispatch)
+
+        # 2. Boss Agent 自动分发给浩（技术评审）和 HR（资源确认）
+        tech_review = Pheromone(
+            type="tech_review",
+            sender="boss_agent",
+            targets=["xiaomei"],
+            content=f"技术评审请求：{dispatch.content}",
+            parent_pheromone_id=dispatch.id,
+            metadata={
+                "parent_dispatch_id": dispatch.id,
+                "reviewer": "xiaomei",
+                "aspect": "技术可行性 + 代码质量 + 性能影响"
+            },
+            hop_count=1
+        )
+        pheromones.append(tech_review)
+
+        resource_confirm = Pheromone(
+            type="resource_confirm",
+            sender="boss_agent",
+            targets=["hr_li"],
+            content=f"资源确认请求：{dispatch.content}",
+            parent_pheromone_id=dispatch.id,
+            metadata={
+                "parent_dispatch_id": dispatch.id,
+                "reviewer": "hr_li",
+                "aspect": "人力资源 + 政策合规"
+            },
+            hop_count=1
+        )
+        pheromones.append(resource_confirm)
+
+        return jsonify({
+            "dispatch": dispatch.to_dict(),
+            "branches": [tech_review.to_dict(), resource_confirm.to_dict()]
+        }), 201
+
+@app.route("/api/multi/respond", methods=["POST"])
+def multi_respond():
+    """
+    场景二：浩（技术评审）或 HR（资源确认）响应
+    两者都 approved 后，Boss Agent 自动生成 final_report 汇总给增
+    """
+    data = request.json or {}
+    sender = validated_sender(data)
+    parent_id = data.get("parent_pheromone_id")
+    judgment = data.get("judgment_status", "approved")  # approved / rejected
+    content = data.get("content", "")
+
+    with _pheromone_lock:
+        # 找到父 pheromone
+        parent = None
+        for p in pheromones:
+            if p.id == parent_id:
+                parent = p
+                break
+
+        if not parent:
+            return jsonify({"error": "parent not found"}), 404
+
+        # 创建响应 pheromone
+        response_type = parent.type  # tech_review 或 resource_confirm
+        response = Pheromone(
+            type=response_type,
+            sender=sender,
+            targets=[parent.metadata.get("original_sender", "employee_zeng")],
+            content=content or f"{sender} 已完成 {response_type} 评审",
+            parent_pheromone_id=parent_id,
+            judgment_status=judgment,
+            metadata={
+                "response_to": parent_id,
+                "reviewer": sender
+            },
+            hop_count=parent.hop_count + 1
+        )
+        pheromones.append(response)
+
+        # 更新父 pheromone 状态
+        parent.judgment_status = judgment
+        parent.status = judgment
+
+        # 检查是否两个都完成了
+        dispatch_id = parent.metadata.get("parent_dispatch_id")
+        if dispatch_id and judgment == "approved":
+            # 查找同级的另一个 review
+            sibling_type = "resource_confirm" if parent.type == "tech_review" else "tech_review"
+            sibling_approved = False
+            for p in pheromones:
+                if p.metadata.get("parent_dispatch_id") == dispatch_id and p.type == sibling_type:
+                    if p.judgment_status == "approved":
+                        sibling_approved = True
+                        break
+
+            # 两者都 approved，生成 final_report
+            if sibling_approved:
+                # 查找原始 dispatch 的 sender
+                dispatch_sender = "employee_zeng"
+                for p in pheromones:
+                    if p.id == dispatch_id:
+                        dispatch_sender = p.metadata.get("original_sender", "employee_zeng")
+                        break
+
+                final_report = Pheromone(
+                    type="final_report",
+                    sender="boss_agent",
+                    targets=[dispatch_sender],
+                    content=f"任务已完成汇总：技术评审通过，资源确认通过。请知悉。",
+                    parent_pheromone_id=dispatch_id,
+                    metadata={
+                        "summary": "技术+资源双评审通过，任务可执行",
+                        "tech_reviewer": "xiaomei",
+                        "resource_reviewer": "hr_li"
+                    },
+                    hop_count=2
+                )
+                pheromones.append(final_report)
+                return jsonify({
+                    "response": response.to_dict(),
+                    "final_report": final_report.to_dict(),
+                    "both_approved": True
+                }), 201
+
+        return jsonify({"response": response.to_dict(), "both_approved": False}), 201
+
+@app.route("/api/multi/pending", methods=["GET"])
+def multi_pending():
+    """获取当前需要响应的 tech_review 和 resource_confirm"""
+    pending = [p for p in pheromones if p.type in ("tech_review", "resource_confirm") and p.status == "pending"]
+    return jsonify([p.to_dict() for p in pending])
+
 # ============ 前端 ============
 
 @app.route("/")
@@ -680,12 +850,99 @@ def index():
         }
 
         .empty-state { text-align: center; padding: 40px 20px; color: #444; }
+
+        /* Tab 切换 */
+        .tab-nav {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 24px;
+            border-bottom: 1px solid #222;
+        }
+        .tab-btn {
+            background: transparent;
+            color: #666;
+            border: none;
+            border-bottom: 2px solid transparent;
+            padding: 10px 20px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .tab-btn:hover { color: #aaa; }
+        .tab-btn.active {
+            color: #6366f1;
+            border-bottom-color: #6366f1;
+        }
+        .scene { display: none; }
+        .scene.active { display: block; }
+
+        /* 场景二样式 */
+        .dispatch-flow {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 15px;
+            flex-wrap: wrap;
+            padding: 20px;
+            background: #16161e;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        .dispatch-node {
+            background: #1a1a24;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 12px 18px;
+            text-align: center;
+        }
+        .dispatch-node .node-name { font-weight: 600; color: #fff; }
+        .dispatch-node .node-role { font-size: 12px; color: #666; margin-top: 4px; }
+        .branch-arrow {
+            font-size: 20px;
+            color: #555;
+        }
+        .pending-review {
+            background: #1a1a24;
+            border: 1px solid #8b5cf6;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 12px;
+        }
+        .pending-review .review-type {
+            font-size: 12px;
+            color: #8b5cf6;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 8px;
+        }
+        .pending-review .review-content {
+            font-size: 14px;
+            color: #ccc;
+            margin-bottom: 12px;
+        }
+        .review-badges {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .review-badge {
+            font-size: 11px;
+            padding: 3px 8px;
+            border-radius: 4px;
+        }
+        .review-badge.tech { background: #3b82f6; color: #fff; }
+        .review-badge.resource { background: #f59e0b; color: #000; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Crew Demo <span style="font-size:14px;color:#666">v1.2</span></h1>
-        <p class="subtitle">安全加固版 · Pheromone 链演示</p>
+        <h1>Crew Demo <span style="font-size:14px;color:#666">v1.3</span></h1>
+        <p class="subtitle">双场景版 · Pheromone 链演示</p>
+
+        <div class="tab-nav">
+            <button class="tab-btn active" onclick="showScene('scene1')">场景一：层级汇报</button>
+            <button class="tab-btn" onclick="showScene('scene2')">场景二：单人调度多 Agent</button>
+        </div>
 
         <div class="status-panel">
             <div class="status-card">
@@ -745,31 +1002,139 @@ def index():
             </div>
         </div>
 
-        <div class="card">
-            <div class="card-title">提交周报</div>
-            <div class="form-group">
-                <label>本周完成的工作</label>
-                <textarea id="report-content" placeholder="例如：完成了用户访谈、整理了需求文档..."></textarea>
+        <!-- 场景一：层级汇报 -->
+        <div id="scene1" class="scene active">
+            <div class="card">
+                <div class="card-title">Agent Profile</div>
+                <div class="profile-grid" id="profile-grid">
+                    <div class="empty-state">加载中...</div>
+                </div>
             </div>
-            <button onclick="submitReport()">提交周报</button>
-            <button class="btn-secondary" onclick="resetDemo()">重置</button>
+
+            <div class="card">
+                <div class="card-title">信息流图</div>
+                <div class="flow-nodes">
+                    <div class="node human">
+                        <div class="node-name">增</div>
+                        <div class="node-role">员工</div>
+                    </div>
+                    <div class="flow-arrow">→</div>
+                    <div class="node agent">
+                        <div class="node-name">Boss Agent</div>
+                        <div class="node-role">AI 汇总</div>
+                    </div>
+                    <div class="flow-arrow">→</div>
+                    <div class="node human">
+                        <div class="node-name">彭老板</div>
+                        <div class="node-role">审批</div>
+                    </div>
+                    <div class="flow-arrow">→</div>
+                    <div class="node human">
+                        <div class="node-name">李HR</div>
+                        <div class="node-role">归档</div>
+                    </div>
+                </div>
+                <div id="pheromone-list">
+                    <div class="empty-state">暂无信息...</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">提交周报</div>
+                <div class="form-group">
+                    <label>本周完成的工作</label>
+                    <textarea id="report-content" placeholder="例如：完成了用户访谈、整理了需求文档..."></textarea>
+                </div>
+                <button onclick="submitReport()">提交周报</button>
+                <button class="btn-secondary" onclick="resetDemo()">重置</button>
+            </div>
+
+            <div class="card">
+                <div class="card-title">Agent 主动创建 Task（Multica 启发）</div>
+                <div class="task-section">
+                    <div class="form-group">
+                        <label>任务内容</label>
+                        <input type="text" id="task-content" placeholder="Boss Agent 发现问题时主动创建">
+                    </div>
+                    <div class="form-group">
+                        <label>类型</label>
+                        <select id="task-type">
+                            <option value="task">任务</option>
+                            <option value="issue">问题</option>
+                        </select>
+                    </div>
+                    <button class="btn-agent" onclick="createTask()">Boss Agent 创建任务</button>
+                </div>
+            </div>
         </div>
 
-        <div class="card">
-            <div class="card-title">Agent 主动创建 Task（Multica 启发）</div>
-            <div class="task-section">
+        <!-- 场景二：单人调度多 Agent -->
+        <div id="scene2" class="scene">
+            <div class="card">
+                <div class="card-title">单人调度多 Agent 演示</div>
+                <div class="dispatch-flow">
+                    <div class="dispatch-node">
+                        <div class="node-name">增</div>
+                        <div class="node-role">发起任务</div>
+                    </div>
+                    <span class="branch-arrow">→</span>
+                    <div class="dispatch-node" style="border-color:#6366f1;">
+                        <div class="node-name">Boss Agent</div>
+                        <div class="node-role">任务分解</div>
+                    </div>
+                    <span class="branch-arrow">↙↘</span>
+                    <div class="dispatch-node">
+                        <div class="node-name">浩</div>
+                        <div class="node-role">技术评审</div>
+                    </div>
+                    <div class="dispatch-node">
+                        <div class="node-name">HR</div>
+                        <div class="node-role">资源确认</div>
+                    </div>
+                    <span class="branch-arrow">↘↙</span>
+                    <div class="dispatch-node" style="border-color:#22c55e;">
+                        <div class="node-name">增</div>
+                        <div class="node-role">收总结果</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">发起任务分发</div>
                 <div class="form-group">
-                    <label>任务内容</label>
-                    <input type="text" id="task-content" placeholder="Boss Agent 发现问题时主动创建">
+                    <label>任务名称</label>
+                    <input type="text" id="dispatch-task-name" placeholder="例如：开发新功能">
                 </div>
                 <div class="form-group">
-                    <label>类型</label>
-                    <select id="task-type">
-                        <option value="task">任务</option>
-                        <option value="issue">问题</option>
-                    </select>
+                    <label>任务描述</label>
+                    <textarea id="dispatch-content" placeholder="描述任务内容..."></textarea>
                 </div>
-                <button class="btn-agent" onclick="createTask()">Boss Agent 创建任务</button>
+                <button class="btn-agent" onclick="dispatchTask()">增发起任务分发</button>
+            </div>
+
+            <div class="card">
+                <div class="card-title">待响应评审 <span id="pending-count" style="color:#8b5cf6;font-weight:600;">0</span></div>
+                <div id="pending-reviews">
+                    <div class="empty-state">暂无待处理评审...</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">最终报告</div>
+                <div id="final-reports">
+                    <div class="empty-state">等待 Boss Agent 汇总...</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">全链路追溯</div>
+                <div id="dispatch-chain">
+                    <div class="empty-state">暂无链路...</div>
+                </div>
+            </div>
+
+            <div style="text-align:center;margin:20px 0;">
+                <button class="btn-secondary" onclick="resetDemo()">重置</button>
             </div>
         </div>
     </div>
@@ -901,9 +1266,101 @@ def index():
         async function resetDemo() {
             await fetch("/api/reset", { method: "POST" });
             await refresh();
+            await loadPendingReviews();
         }
 
-        Promise.all([refresh(), loadProfiles()]);
+        // 场景切换
+        function showScene(name) {
+            document.querySelectorAll('.scene').forEach(s => s.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.getElementById(name).classList.add('active');
+            event.target.classList.add('active');
+        }
+
+        // 场景二：任务分发
+        async function dispatchTask() {
+            const taskName = document.getElementById("dispatch-task-name").value.trim();
+            const content = document.getElementById("dispatch-content").value.trim();
+            if (!content) { alert("请填写任务描述"); return; }
+            await fetch("/api/multi/dispatch", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "X-Agent-ID": "employee_zeng" },
+                body: JSON.stringify({ task_name: taskName, content })
+            });
+            document.getElementById("dispatch-task-name").value = "";
+            document.getElementById("dispatch-content").value = "";
+            await loadPendingReviews();
+            await refresh();
+        }
+
+        // 场景二：加载待评审
+        async function loadPendingReviews() {
+            const pending = await fetch("/api/multi/pending").then(r => r.json());
+            document.getElementById("pending-count").textContent = pending.length;
+            const container = document.getElementById("pending-reviews");
+            if (pending.length === 0) {
+                container.innerHTML = '<div class="empty-state">暂无待处理评审...</div>';
+            } else {
+                container.innerHTML = pending.map(p => {
+                    const badgeClass = p.type === "tech_review" ? "tech" : "resource";
+                    const reviewer = p.type === "tech_review" ? "浩" : "HR";
+                    return `
+                        <div class="pending-review">
+                            <div class="review-type">${p.type === "tech_review" ? "技术评审" : "资源确认"}</div>
+                            <div class="review-content">${p.content}</div>
+                            <div class="review-badges">
+                                <span class="review-badge ${badgeClass}">${reviewer} 评审</span>
+                                <span style="font-size:12px;color:#666;">hop ${p.hop_count}</span>
+                            </div>
+                            <div style="margin-top:12px;display:flex;gap:10px;">
+                                <button onclick="respondReview('${p.id}', 'approved', '${reviewer}')" style="background:#22c55e;color:#000;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;">批准</button>
+                                <button onclick="respondReview('${p.id}', 'rejected', '${reviewer}')" style="background:#ef4444;color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;">退回</button>
+                            </div>
+                        </div>
+                    `;
+                }).join("");
+            }
+            // 加载最终报告
+            await loadFinalReports();
+        }
+
+        // 场景二：响应评审
+        async function respondReview(pid, judgment, reviewerRole) {
+            const sender = reviewerRole === "浩" ? "xiaomei" : "hr_li";
+            const content = judgment === "approved"
+                ? `${reviewerRole} 评审通过`
+                : `${reviewerRole} 评审退回，建议修改`;
+            const result = await fetch("/api/multi/respond", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "X-Agent-ID": sender },
+                body: JSON.stringify({ parent_pheromone_id: pid, judgment_status: judgment, content })
+            }).then(r => r.json());
+            await loadPendingReviews();
+            await refresh();
+            if (result.final_report) {
+                await loadFinalReports();
+            }
+        }
+
+        // 场景二：加载最终报告
+        async function loadFinalReports() {
+            const pheromones = await fetch("/api/pheromones").then(r => r.json());
+            const reports = pheromones.filter(p => p.type === "final_report");
+            const container = document.getElementById("final-reports");
+            if (reports.length === 0) {
+                container.innerHTML = '<div class="empty-state">等待 Boss Agent 汇总...</div>';
+            } else {
+                container.innerHTML = reports.map(r => `
+                    <div style="background:#16161e;border:1px solid #22c55e;border-radius:8px;padding:16px;margin-bottom:10px;">
+                        <div style="font-size:12px;color:#22c55e;margin-bottom:8px;">✓ 最终报告</div>
+                        <div style="font-size:14px;color:#ccc;">${r.content}</div>
+                        <div style="font-size:12px;color:#666;margin-top:8px;">hop ${r.hop_count} · ${r.sender}</div>
+                    </div>
+                `).join("");
+            }
+        }
+
+        Promise.all([refresh(), loadProfiles(), loadPendingReviews()]);
     </script>
 </body>
 </html>
