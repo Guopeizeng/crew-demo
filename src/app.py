@@ -1,8 +1,10 @@
 """
 Crew Demo - 周报聚合场景
-最小可演示版本
+最小可演示版本 v0.2
 
-run: python src/main.py
+新增：visibility 字段（public | private_to_sender | private_to_target | private_to_group）
+
+run: python src/app.py
 """
 from flask import Flask, jsonify, request
 from datetime import datetime
@@ -14,7 +16,8 @@ app = Flask(__name__)
 
 class Pheromone:
     def __init__(self, id=None, type=None, sender=None, targets=None, content=None,
-                 parent_pheromone_id=None, judgment_status="pending", metadata=None):
+                 parent_pheromone_id=None, judgment_status="pending", metadata=None,
+                 visibility="public", visible_to=None):
         self.id = id or str(uuid.uuid4())[:8]
         self.type = type
         self.sender = sender
@@ -23,10 +26,12 @@ class Pheromone:
         self.parent_pheromone_id = parent_pheromone_id
         self.judgment_status = judgment_status
         self.metadata = metadata or {}
+        self.visibility = visibility  # public | private_to_sender | private_to_target | private_to_group
+        self.visible_to = visible_to or []  # 私有可见对象列表 ["EP001", "EP002"]
         self.timestamp = datetime.utcnow().isoformat() + "Z"
 
-    def to_dict(self):
-        return {
+    def to_dict(self, viewer=None):
+        d = {
             "id": self.id,
             "type": self.type,
             "sender": self.sender,
@@ -35,8 +40,22 @@ class Pheromone:
             "parent_pheromone_id": self.parent_pheromone_id,
             "judgment_status": self.judgment_status,
             "metadata": self.metadata,
+            "visibility": self.visibility,
             "timestamp": self.timestamp
         }
+        # 权限过滤：私有信息只对特定 EP 可见
+        if self.visibility == "public":
+            pass  # 所有人都能看到
+        elif self.visibility == "private_to_sender":
+            if viewer != self.sender:
+                d["content"] = "[私有 - 仅发送者可见]"
+        elif self.visibility == "private_to_target":
+            if viewer not in self.targets:
+                d["content"] = "[私有 - 仅目标可见]"
+        elif self.visibility == "private_to_group":
+            if viewer not in self.visible_to:
+                d["content"] = "[私有 - 仅群组成员可见]"
+        return d
 
 # ============ 模拟数据 ============
 
@@ -61,7 +80,8 @@ def get_participants():
 @app.route("/api/pheromones", methods=["GET"])
 def get_pheromones():
     """获取所有信息素"""
-    return jsonify([p.to_dict() for p in pheromones])
+    viewer = request.args.get("viewer")  # 可选：按 viewer 过滤可见性
+    return jsonify([p.to_dict(viewer) for p in pheromones])
 
 @app.route("/api/pheromones", methods=["POST"])
 def create_pheromone():
@@ -73,7 +93,9 @@ def create_pheromone():
         targets=data.get("targets", []),
         content=data.get("content"),
         parent_pheromone_id=data.get("parent_pheromone_id"),
-        metadata=data.get("metadata", {})
+        metadata=data.get("metadata", {}),
+        visibility=data.get("visibility", "public"),
+        visible_to=data.get("visible_to", [])
     )
     pheromones.append(p)
 
@@ -88,14 +110,16 @@ def create_pheromone():
 @app.route("/api/pheromones/<pid>", methods=["GET"])
 def get_pheromone(pid):
     """获取单条信息素"""
+    viewer = request.args.get("viewer")
     for p in pheromones:
         if p.id == pid:
-            return jsonify(p.to_dict())
+            return jsonify(p.to_dict(viewer))
     return jsonify({"error": "not found"}), 404
 
 @app.route("/api/chain/<pid>", methods=["GET"])
 def get_chain(pid):
     """获取信息素链路"""
+    viewer = request.args.get("viewer")
     chain = []
     target_id = pid
 
@@ -107,7 +131,7 @@ def get_chain(pid):
                 found = p
                 break
         if found:
-            chain.append(found.to_dict())
+            chain.append(found.to_dict(viewer))
             target_id = found.parent_pheromone_id if found.parent_pheromone_id != found.id else None
         else:
             break
@@ -116,19 +140,19 @@ def get_chain(pid):
     # 扫描所有 pheromone，把 parent_pheromone_id == pid 的追加进来
     for p in pheromones:
         if p.parent_pheromone_id == pid:
-            chain.append(p.to_dict())
+            chain.append(p.to_dict(viewer))
             # 递归获取子节点的子节点
-            chain.extend(get_sub_chain(p.id))
+            chain.extend(get_sub_chain(p.id, viewer))
 
     return jsonify(chain)
 
-def get_sub_chain(pid):
+def get_sub_chain(pid, viewer=None):
     """递归获取子链路"""
     sub = []
     for p in pheromones:
         if p.parent_pheromone_id == pid:
-            sub.append(p.to_dict())
-            sub.extend(get_sub_chain(p.id))
+            sub.append(p.to_dict(viewer))
+            sub.extend(get_sub_chain(p.id, viewer))
     return sub
 
 @app.route("/api/reset", methods=["POST"])
@@ -142,7 +166,6 @@ def reset():
 
 def handle_weekly_report(p):
     """处理周报：触发 Boss Agent 生成汇总"""
-    # 模拟 Boss Agent 思考延迟
     digest = Pheromone(
         type="weekly_digest",
         sender="boss_agent",
@@ -156,7 +179,6 @@ def handle_weekly_report(p):
 
 def generate_digest_content():
     """生成周报汇总内容"""
-    # 简单汇总所有 pending 的周报
     reports = [p for p in pheromones if p.type == "weekly_report"]
     count = len(reports)
     contents = [p.content for p in reports]
@@ -252,7 +274,6 @@ def index():
             color: #444;
             font-size: 20px;
         }
-        .flow-arrow.active { color: #6366f1; }
 
         .pheromone-line {
             display: flex;
@@ -274,6 +295,7 @@ def index():
             min-width: 80px;
             text-align: center;
         }
+        .pheromone-badge.private { background: #f59e0b; }
         .pheromone-content {
             flex: 1;
             font-size: 14px;
@@ -345,6 +367,7 @@ def index():
             border: 1px solid #222;
             border-radius: 12px;
             padding: 30px;
+            margin-bottom: 30px;
         }
         .result-title {
             font-size: 14px;
@@ -410,6 +433,35 @@ def index():
             margin-left: 10px;
         }
         .reset-btn:hover { border-color: #6366f1; color: #6366f1; }
+
+        /* 私有消息提示 */
+        .private-hint {
+            background: #f59e0b;
+            color: #000;
+            font-size: 11px;
+            padding: 2px 6px;
+            border-radius: 3px;
+            margin-left: 8px;
+        }
+
+        /* 切换视图 */
+        .viewer-switch {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        .viewer-btn {
+            background: #1a1a24;
+            border: 1px solid #333;
+            color: #888;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-size: 13px;
+            cursor: pointer;
+        }
+        .viewer-btn:hover { border-color: #6366f1; color: #6366f1; }
+        .viewer-btn.active { background: #6366f1; border-color: #6366f1; color: #fff; }
     </style>
 </head>
 <body>
@@ -474,6 +526,15 @@ def index():
                 <label>本周完成的工作</label>
                 <textarea id="report-content" placeholder="例如：完成了用户访谈、整理了需求文档、协调了周会..."></textarea>
             </div>
+            <div class="form-group">
+                <label>隐私级别</label>
+                <select id="report-visibility" style="background:#1a1a24;border:1px solid #333;border-radius:8px;padding:8px;color:#e0e0e0;font-size:14px;width:100%;">
+                    <option value="public" selected>公开 - 所有人都能看见</option>
+                    <option value="private_to_sender">私有 - 仅发送者可见</option>
+                    <option value="private_to_target">私有 - 仅目标可见</option>
+                    <option value="private_to_group">私有 - 仅群组成员可见</option>
+                </select>
+            </div>
             <button onclick="submitReport()">提交周报</button>
             <button class="reset-btn" onclick="resetDemo()">重置</button>
         </div>
@@ -481,6 +542,14 @@ def index():
         <!-- 链路追溯 -->
         <div class="result-area">
             <div class="action-title">链路追溯</div>
+            <div class="viewer-switch">
+                <span style="color:#666;font-size:13px;margin-right:10px;">模拟视角：</span>
+                <button class="viewer-btn active" onclick="setViewer(null)">全局视图</button>
+                <button class="viewer-btn" onclick="setViewer('employee_zeng')">增 (EP001)</button>
+                <button class="viewer-btn" onclick="setViewer('boss_agent')">Boss Agent (EP002)</button>
+                <button class="viewer-btn" onclick="setViewer('manager_peng')">彭老板 (EP003)</button>
+                <button class="viewer-btn" onclick="setViewer('hr_li')">李HR (EP004)</button>
+            </div>
             <div id="chain-list">
                 <div class="empty-state">暂无链路，点击上方节点查看详情...</div>
             </div>
@@ -488,7 +557,15 @@ def index():
     </div>
 
     <script>
-        let currentChain = [];
+        let currentViewer = null;
+
+        function setViewer(viewer) {
+            currentViewer = viewer;
+            document.querySelectorAll('.viewer-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.textContent.includes(viewer || '全局'));
+            });
+            refresh();
+        }
 
         async function submitReport() {
             const content = document.getElementById("report-content").value.trim();
@@ -496,6 +573,8 @@ def index():
                 alert("请填写周报内容");
                 return;
             }
+
+            const visibility = document.getElementById("report-visibility").value;
 
             const btn = document.querySelector(".action-area button");
             btn.disabled = true;
@@ -509,7 +588,9 @@ def index():
                         type: "weekly_report",
                         sender: "employee_zeng",
                         targets: ["boss_agent"],
-                        content: content
+                        content: content,
+                        visibility: visibility,
+                        visible_to: visibility === "private_to_group" ? ["EP001", "EP002"] : []
                     })
                 });
 
@@ -531,7 +612,7 @@ def index():
                 headers: {"Content-Type": "application/json"},
                 body: JSON.stringify({
                     type: "approval",
-                    sender: getCurrentUser(),
+                    sender: "manager_peng",
                     targets: [pheromoneId],
                     content: "已阅",
                     parent_pheromone_id: pheromoneId,
@@ -541,27 +622,16 @@ def index():
             await refresh();
         }
 
-        function getCurrentUser() {
-            // 轮流扮演老板和HR
-            const pendings = document.querySelectorAll('.approve-btn');
-            if (pendings.length > 0) {
-                return pendings[0].dataset.sender;
-            }
-            return "manager_peng";
-        }
-
         async function refresh() {
-            // 刷新 pheromone 列表
-            const res = await fetch("/api/pheromones");
+            const viewerParam = currentViewer ? `?viewer=${currentViewer}` : "";
+            const res = await fetch("/api/pheromones" + viewerParam);
             const data = await res.json();
 
-            // 更新状态面板
             document.getElementById("total-count").textContent = data.length;
             document.getElementById("pending-count").textContent = data.filter(p => p.judgment_status === "pending").length;
             document.getElementById("approved-count").textContent = data.filter(p => p.judgment_status === "approved").length;
             document.getElementById("done-count").textContent = data.filter(p => p.type === "approval").length;
 
-            // 渲染 pheromone 列表
             const list = document.getElementById("pheromone-list");
             if (data.length === 0) {
                 list.innerHTML = '<div class="empty-state">暂无信息，等待提交周报...</div>';
@@ -570,13 +640,16 @@ def index():
                     const statusClass = p.judgment_status === "pending" ? "pending" : "approved";
                     const statusText = p.judgment_status === "pending" ? "待审批" : "已审批";
                     const isProcessed = p.type === "approval";
+                    const isPrivate = p.visibility !== "public";
+                    const badgeClass = isPrivate ? "pheromone-badge private" : "pheromone-badge";
+                    const privateHint = isPrivate ? `<span class="private-hint">${p.visibility}</span>` : "";
                     return `
                         <div class="pheromone-line ${isProcessed ? 'processed' : ''}">
-                            <div class="pheromone-badge">${p.type}</div>
+                            <div class="${badgeClass}">${p.type}${privateHint}</div>
                             <div class="pheromone-content">${p.content}</div>
                             <div>
                                 <span class="pheromone-status ${statusClass}">${statusText}</span>
-                                ${p.judgment_status === "pending" && p.type !== "approval" ? `<button class="approve-btn" data-sender="${p.targets[0]}" onclick="approve('${p.id}')" style="margin-left:10px;padding:4px 12px;font-size:12px;background:#22c55e;color:#000;border:none;border-radius:4px;cursor:pointer">批准</button>` : ''}
+                                ${p.judgment_status === "pending" && p.type !== "approval" ? `<button class="approve-btn" onclick="approve('${p.id}')" style="margin-left:10px;padding:4px 12px;font-size:12px;background:#22c55e;color:#000;border:none;border-radius:4px;cursor:pointer">批准</button>` : ''}
                             </div>
                         </div>
                     `;
@@ -589,7 +662,6 @@ def index():
             await refresh();
         }
 
-        // 初始化
         refresh();
     </script>
 </body>
