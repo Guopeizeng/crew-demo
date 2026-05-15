@@ -1,0 +1,26 @@
+[
+  {
+    "agent_id": "agent_001",
+    "name": "Agent Alpha",
+    "role": "worker",
+    "specialty": "",
+    "peer_eps": [],
+    "judgment_criteria": []
+  },
+  {
+    "agent_id": "agent_002",
+    "name": "Agent Beta",
+    "role": "coordinator",
+    "specialty": "",
+    "peer_eps": [],
+    "judgment_criteria": []
+  },
+  {
+    "agent_id": "agent_003",
+    "name": "Agent Gamma",
+    "role": "approver",
+    "specialty": "",
+    "peer_eps": [],
+    "judgment_criteria": []
+  }
+]
