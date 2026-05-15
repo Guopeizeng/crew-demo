@@ -1,138 +1,102 @@
-# Crew Demo - 周报聚合场景
+# Crew Demo - SPEC
 
-> **版本**: v0.1 最小可演示版
-> **目标**: 跑通"周报聚合"端到端场景，证明 Pheromone 链的价值
+> **版本**: v2.0 通用框架版
+> **定位**: 零硬编码 Pheromone 框架，任何人可下载使用
 
 ---
 
 ## 一句话定位
 
-**信息自己知道去哪，Crew Pro 让周报自动找到该看到的人。**
+**Pheromone Chain Framework** — 让信息自己知道去哪。
 
 ---
 
-## 场景描述
+## 核心设计
 
-```
-Human A（员工）发周报 
-  → Boss Agent 收到 
-  → Boss Agent 自动生成部门周报 
-  → 分发给 Human B（老板）+ Human C（HR）
-```
-
----
-
-## Pheromone 链设计
-
-### P1 - 员工提交周报
+### Pheromone 模型
 
 ```json
 {
-  "id": "p1",
-  "type": "weekly_report",
-  "sender": "employee_zeng",
-  "target": "boss_agent",
-  "content": "本周完成了用户调研、V1原型、团队周会协调",
-  "judgment_status": "pending",
-  "timestamp": "2026-05-14T10:00:00Z"
+  "id": "abc12345",
+  "type": "user_defined_string",
+  "sender": "agent_001",
+  "targets": ["agent_002", "agent_003"],
+  "content": "Hello World",
+  "parent_pheromone_id": null,
+  "hop_count": 0,
+  "timestamp": "2026-05-15T10:00:00Z",
+  "metadata": {}
 }
 ```
 
-### P2 - Boss Agent 生成部门周报（自动）
+### Agent 模型
 
 ```json
 {
-  "id": "p2",
-  "type": "weekly_digest",
-  "sender": "boss_agent",
-  "targets": ["manager_peng", "hr_li"],
-  "content": "部门周报汇总：3人提交，1人缺席。主要进展：用户调研完成，V1原型启动。",
-  "parent_pheromone_id": "p1",
-  "judgment_status": "pending",
-  "timestamp": "2026-05-14T10:00:30Z"
+  "agent_id": "agent_001",
+  "name": "Agent Alpha",
+  "role": "worker",
+  "specialty": "",
+  "peer_eps": [],
+  "judgment_criteria": []
 }
 ```
 
-### P3 - 老板审批
+### Hook 机制
+
+当某 type 的 pheromone 创建时，自动触发预设的 reply action。
 
 ```json
 {
-  "id": "p3",
-  "type": "approval",
-  "sender": "manager_peng",
-  "target": "p2",
-  "content": "已阅，本周进展正常",
-  "judgment_status": "approved",
-  "parent_pheromone_id": "p2",
-  "timestamp": "2026-05-14T10:05:00Z"
-}
-```
-
-### P4 - HR 归档
-
-```json
-{
-  "id": "p4",
-  "type": "approval",
-  "sender": "hr_li",
-  "target": "p2",
-  "content": "已归档HR系统",
-  "judgment_status": "approved",
-  "parent_pheromone_id": "p2",
-  "timestamp": "2026-05-14T10:06:00Z"
+  "on_create": {
+    "task": {
+      "action": "reply",
+      "sender": "agent_002",
+      "reply_type": "response",
+      "targets": ["agent_001"],
+      "content": "Auto response"
+    }
+  }
 }
 ```
 
 ---
 
-## 信息流图
+## 安全协议
 
-```
-[增] ──── P1 ────→ [Boss Agent]
-                          │
-                    自动生成 P2
-                          │
-              ┌───────────┴───────────┐
-              ↓                       ↓
-        [老板] P3                  [HR] P4
-```
+| 漏洞 | 协议 | 状态 |
+|------|------|------|
+| Pheromone Storm | hop_count ≥ 5 → timeout | ✅ |
+| 僵尸信息素 | pending > 600s → DLQ | ✅ |
+| 身份伪造 | X-Agent-ID 强制验证 | ✅ |
+| 并发双花 | 全局写锁 | ✅ |
 
 ---
 
-## 参与者
+## API 端点
 
-| ID | Role | EP | 说明 |
-|----|------|-----|------|
-| employee_zeng | 员工 | EP001 | 提交周报的普通员工 |
-| boss_agent | Boss Agent | EP002 | 自动汇总周报 |
-| manager_peng | 老板 | EP003 | 审批部门周报 |
-| hr_li | HR | EP004 | 归档HR系统 |
-
----
-
-## 技术方案
-
-- **语言**: Python 3.14+
-- **框架**: Flask
-- **数据库**: SQLite（单文件）
-- **LLM**: DeepSeek（默认）/ OpenAI
-- **前端**: 单页 HTML + Vanilla JS（无框架）
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/agents` | GET/POST | 获取/注册 agent |
+| `/api/agents/<id>` | DELETE/PUT | 删除/更新 agent |
+| `/api/pheromones` | GET/POST | 获取/创建 pheromone |
+| `/api/chain/<id>` | GET | 链路追溯 |
+| `/api/dlq` | GET | 死信队列 |
+| `/api/hooks` | GET/PUT | 获取/更新 hook 配置 |
+| `/api/reset` | POST | 重置 |
 
 ---
 
-## 验收标准
+## 配置
 
-1. [ ] 员工提交周报后，Boss Agent 自动生成部门周报
-2. [ ] 部门周报自动分发给老板和HR
-3. [ ] 老板和HR可以审批，信息链路可追溯
-4. [ ] 能截图展示 Pheromone 链的全流程
-5. [ ] Demo UI 让人一眼看懂价值
+- `config/agents.json` — agent 列表
+- `config/hooks.json` — hook 规则
 
 ---
 
 ## 不做的事
 
-- 多租户
-- 插件体系
-- 通用路由引擎
+- 硬编码角色
+- 内置业务逻辑
 - 用户认证
+- 多租户
