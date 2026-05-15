@@ -114,6 +114,9 @@ class Pheromone:
     def get_age_seconds(self):
         return (datetime.utcnow() - self._created_at).total_seconds()
 
+    def should_escalate(self):
+        return self.hop_count >= MAX_HOPS
+
 # ============ 存储 ============
 
 pheromones = []
