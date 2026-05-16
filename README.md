@@ -38,6 +38,9 @@
 | 身份伪造 | X-Agent-ID 强制验证 | ✅ |
 | 薛定谔 JSON | type/content 用户自定义 | ✅ |
 | 并发双花 | 全局写锁（threading.Lock） | ✅ |
+| Hook 死锁 | trigger_hooks 在锁外调用 | ✅ v2.1 |
+| 链路递归循环 | visited 检测防止栈溢出 | ✅ v2.1 |
+| DLQ 竞态 | check_dlq 内部加锁 | ✅ v2.1 |
 
 ---
 
@@ -70,10 +73,12 @@ open http://localhost:5200
 - 填写 content
 - 多选 targets
 - 可选填 parent_pheromone_id 构建链路
+- **每条 pheromone 可直接 approve/reject**（pending 状态显示按钮）
 
 ### Tab3: Chain Lookup
 - 输入 pheromone id
-- 可视化完整链路
+- **树形链路可视化**（分支结构，而非线性）
+- 显示每节点 type、sender、content、hop_count
 
 ### Tab4: Hooks Config
 - 配置自动触发规则
@@ -127,7 +132,9 @@ open http://localhost:5200
 | `/api/agents/<id>` | PUT | 更新 agent |
 | `/api/pheromones` | GET | 获取所有 pheromone |
 | `/api/pheromones` | POST | 创建 pheromone |
-| `/api/chain/<id>` | GET | 链路追溯 |
+| `/api/pheromones/<id>/judge` | PUT | 审批 pheromone（approved/rejected） |
+| `/api/chain/<id>` | GET | 链路追溯（线性） |
+| `/api/chain/<id>/tree` | GET | 链路树形可视化 |
 | `/api/dlq` | GET | 死信队列 |
 | `/api/hooks` | GET | 获取 hook 配置 |
 | `/api/hooks` | PUT | 更新 hook 配置 |
