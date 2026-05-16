@@ -1,8 +1,66 @@
 # Crew Demo
 
-**Generic Pheromone Framework** — 让信息自己知道去哪。
+**让信息自己知道去哪。**
 
-一个零硬编码的通用 Pheromone（信息素）框架，任何人都可以下载使用，通过配置定义自己的场景。
+一个通用的 Pheromone（信息素）框架——给 AI Agent 用的消息传递协议。你可以用它快速搭建多 Agent 协作系统、审批流、知识追踪链路。
+
+用它替代复杂的消息队列，实现"信息知道该去哪"的智能路由。
+
+---
+
+## 一句话理解
+
+```
+你发出一条信息 → 它自动找到该看的人 → 形成可追溯的链路
+```
+
+不需要配置路由规则。Pheromone 自己会沿着链路传播。
+
+---
+
+## 快速开始
+
+```bash
+git clone https://github.com/Guopeizeng/crew-demo.git
+cd crew-demo/src
+python app.py
+
+# 打开浏览器
+open http://localhost:5200
+```
+
+默认自带 3 个示例 Agent，直接发送消息试试。
+
+---
+
+## 场景示例
+
+### 场景：任务协作
+
+**甲** 发起任务 → **乙** 评审 → **丙** 审批
+
+```
+[甲] ── task ──→ [乙] ── review ──→ [丙]
+                     │
+                     └── 通过 → 自动通知甲
+```
+
+在 UI 上操作：
+1. **Send Pheromone** → 选甲，type=task，targets=乙
+2. Chain Lookup → 输入 id → 看完整链路
+3. 乙点 **approve** → 链路继续传播 → 甲收到结果
+
+### 场景：自动回复
+
+配置 Hook：type=task 时自动由 agent_002 回复
+
+```
+甲发送 task
+      ↓
+系统自动触发
+      ↓
+agent_002 收到自动回复
+```
 
 ---
 
@@ -10,107 +68,47 @@
 
 ### Pheromone（信息素）
 
-信息的标准载体，是 Crew Pro 协议的最小执行单元。
+一条消息，携带：
+- **type** — 消息类型（task、approval、feedback...）
+- **sender** — 谁发的
+- **targets** — 发给谁
+- **content** — 内容
+- **parent_pheromone_id** — 父节点（形成链路）
 
-| 字段 | 说明 |
+### Agent
+
+任意角色。你定义它是 worker、coordinator 还是 approver。
+
+### Chain（链路）
+
+每个 Pheromone 知道自己是谁发的、发给谁。顺着 `parent_pheromone_id` 可以追溯完整链路。
+
+---
+
+## 功能
+
+| 功能 | 说明 |
 |------|------|
-| `id` | 唯一标识 |
-| `type` | 任意字符串（如 message, task, approval）— 完全由用户定义 |
-| `sender` | 发送者 ID（强制从 X-Agent-ID 头读取） |
-| `targets` | 目标 ID 列表 |
-| `content` | 信息内容 |
-| `parent_pheromone_id` | 父节点，形成链路 |
-| `hop_count` | 跳转次数（防 Storm，上限 5） |
-
-### Agent Profile
-
-每个 Agent 是独立个体，无预设角色。通过 API 注册或从 `config/agents.json` 加载。
+| **发送信息** | 选 sender → 填 type → 写内容 → 发给谁 |
+| **链路追溯** | 输入任意 pheromone id，看它的完整链路（树形图） |
+| **审批流** | pending 状态可 approve/reject，状态不可逆 |
+| **自动触发** | 配置 Hook，某种 type 出现时自动回复 |
+| **TTL 机制** | 信息有过期时间，超时自动清理 |
 
 ---
 
-## 安全协议
+## 配置（可选）
 
-| 漏洞 | 协议 | 状态 |
-|------|------|------|
-| Pheromone Storm | hop_count ≥ MAX_HOPS → 强制 timeout | ✅ |
-| 僵尸信息素 | pending > 600s → DLQ | ✅ |
-| 上下文雪崩 | 链路过长时需 hook 压缩 | ✅ |
-| 身份伪造 | X-Agent-ID 强制验证 | ✅ |
-| 薛定谔 JSON | type/content 用户自定义 | ✅ |
-| 并发双花 | 全局写锁（threading.Lock） | ✅ |
-| Hook 死锁 | trigger_hooks 在锁外调用 | ✅ v2.1 |
-| 链路递归循环 | visited 检测防止栈溢出 | ✅ v2.1 |
-| DLQ 竞态 | check_dlq 内部加锁 | ✅ v2.1 |
-| agent_id 注入 | 禁止 ../，限制字符集 a-zA-Z0-9_- | ✅ v2.1 |
-| content 长度 | 限制 ≤10000 字符 | ✅ v2.1 |
-| type 格式 | 限制 ≤64 字符 alphanumeric | ✅ v2.1 |
-| metadata 注入 | 禁止 __ 开头键名 | ✅ v2.1 |
-| 状态机保护 | 已审批不可二次修改 | ✅ v2.1 |
+默认 3 个 Agent 开箱即用。如需自定义：
 
----
-
-## 快速启动
-
-```bash
-git clone https://github.com/yourname/crew_demo.git
-cd crew_demo
-
-# 运行（会自动加载 config/agents.json 的默认3个 agent）
-cd src
-python app.py
-
-# 打开浏览器
-open http://localhost:5200
-```
-
----
-
-## 四个 Tab
-
-### Tab1: Agents
-- 查看所有已注册 agent
-- 添加新 agent（指定 id, name, role）
-- 删除 agent
-
-### Tab2: Send Pheromone
-- 选择 sender（从已注册 agent 选择）
-- 输入 type（任意字符串）
-- 填写 content
-- 多选 targets
-- 可选填 parent_pheromone_id 构建链路
-- **每条 pheromone 可直接 approve/reject**（pending 状态显示按钮）
-
-### Tab3: Chain Lookup
-- 输入 pheromone id
-- **树形链路可视化**（分支结构，而非线性）
-- 显示每节点 type、sender、content、hop_count
-
-### Tab4: Hooks Config
-- 配置自动触发规则
-- 当某 type 的 pheromone 创建时，自动发送 reply
-- 示例：type=task 时自动由 agent_002 回复
-
----
-
-## 配置
-
-### config/agents.json
-
+**config/agents.json**
 ```json
 [
-  {
-    "agent_id": "agent_001",
-    "name": "Agent Alpha",
-    "role": "worker",
-    "specialty": "",
-    "peer_eps": [],
-    "judgment_criteria": []
-  }
+  { "agent_id": "my_agent", "name": "我的 Agent", "role": "worker" }
 ]
 ```
 
-### config/hooks.json
-
+**config/hooks.json**
 ```json
 {
   "on_create": {
@@ -119,7 +117,7 @@ open http://localhost:5200
       "sender": "agent_002",
       "reply_type": "response",
       "targets": ["agent_001"],
-      "content": "Auto response to task"
+      "content": "已收到，我会处理"
     }
   }
 }
@@ -127,60 +125,24 @@ open http://localhost:5200
 
 ---
 
-## API 文档
+## API（开发者用）
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/api/agents` | GET | 获取所有 agent |
-| `/api/agents` | POST | 注册新 agent |
-| `/api/agents/<id>` | DELETE | 删除 agent |
-| `/api/agents/<id>` | PUT | 更新 agent |
-| `/api/pheromones` | GET | 获取所有 pheromone |
-| `/api/pheromones` | POST | 创建 pheromone |
-| `/api/pheromones/<id>/judge` | PUT | 审批 pheromone（approved/rejected） |
-| `/api/chain/<id>` | GET | 链路追溯（线性） |
+| `/api/pheromones` | GET/POST | 发送/查看信息 |
+| `/api/pheromones/<id>/judge` | PUT | 审批（approve/reject） |
 | `/api/chain/<id>/tree` | GET | 链路树形可视化 |
-| `/api/dlq` | GET | 死信队列 |
-| `/api/hooks` | GET | 获取 hook 配置 |
-| `/api/hooks` | PUT | 更新 hook 配置 |
-| `/api/reset` | POST | 重置数据 |
-
-### 发送 Pheromone
-
-```bash
-curl -X POST http://localhost:5200/api/pheromones \
-  -H "Content-Type: application/json" \
-  -H "X-Agent-ID: agent_001" \
-  -d '{
-    "type": "hello",
-    "sender": "agent_001",
-    "targets": ["agent_002"],
-    "content": "Hello World"
-  }'
-```
-
-### 注册 Agent
-
-```bash
-curl -X POST http://localhost:5200/api/agents \
-  -H "Content-Type: application/json" \
-  -d '{
-    "agent_id": "agent_004",
-    "name": "Agent Delta",
-    "role": "coordinator"
-  }'
-```
+| `/api/agents` | GET/POST | 管理 Agent |
+| `/api/hooks` | GET/PUT | 配置自动触发 |
 
 ---
 
-## 技术栈
+## 技术细节
 
-| 层级 | 技术 |
-|------|------|
-| 后端 | Python / Flask |
-| 前端 | Vanilla JS（零依赖） |
-| 存储 | 内存（可扩展 SQLite） |
-| 配置 | JSON 文件 |
+- 后端：Python / Flask
+- 前端：Vanilla JS，零依赖
+- 存储：内存（重启清空，可扩展）
+- 安全：X-Agent-ID 验证、输入校验、写锁保护
 
 ---
 
