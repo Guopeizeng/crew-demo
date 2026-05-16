@@ -10,6 +10,7 @@ import uuid
 import threading
 import json
 import os
+import re
 
 app = Flask(__name__)
 
@@ -203,13 +204,16 @@ def create_agent():
     agent_id = data.get("agent_id")
     if not agent_id:
         return jsonify({"error": "agent_id required"}), 400
+    # 格式校验：只允许字母、数字、下划线、连字符
+    if not re.match(r'^[a-zA-Z0-9_-]+$', agent_id):
+        return jsonify({"error": "agent_id must be alphanumeric (a-zA-Z0-9_-)"}), 400
     if any(a.agent_id == agent_id for a in AGENTS):
         return jsonify({"error": "agent_id already exists"}), 409
     agent = AgentProfile(
         agent_id=agent_id,
         name=data.get("name", agent_id),
         role=data.get("role", "unknown"),
-        specialty=data.get("specialty", ""),
+        specialty=data.get("specialty", "")[:100],
         peer_eps=data.get("peer_eps", []),
         judgment_criteria=data.get("judgment_criteria", [])
     )
@@ -251,14 +255,33 @@ def create_pheromone():
     parent_id = data.get("parent_pheromone_id")
     hop_count = compute_hop_count(parent_id)
 
+    # 格式校验
+    p_type = data.get("type", "message")
+    if len(p_type) > 64 or not re.match(r'^[a-zA-Z0-9_-]+$', p_type):
+        return jsonify({"error": "type must be <=64 chars, alphanumeric + underscore"}), 400
+
+    content = data.get("content", "")
+    if len(content) > 10000:
+        return jsonify({"error": "content must be <= 10000 chars"}), 400
+
+    targets = data.get("targets", [])
+    if not isinstance(targets, list):
+        return jsonify({"error": "targets must be a list"}), 400
+
+    # metadata 安全性：禁止 __ 开头（防止 __class__ 等特殊属性）
+    metadata = data.get("metadata", {}) or {}
+    for key in metadata:
+        if key.startswith("__") or key in ("__init__", "__class__", "__globals__", "__import__"):
+            return jsonify({"error": "metadata key not allowed"}), 400
+
     # 创建 pheromone（不含 hop_count，让 compute_hop_count 算）
     p = Pheromone(
-        type=data.get("type", "message"),
+        type=p_type,
         sender=sender,
-        targets=data.get("targets", []),
-        content=data.get("content", ""),
+        targets=targets,
+        content=content,
         parent_pheromone_id=parent_id,
-        metadata=data.get("metadata", {}),
+        metadata=metadata,
         hop_count=hop_count
     )
 
@@ -293,6 +316,9 @@ def judge_pheromone(pid):
     with _pheromone_lock:
         for p in pheromones:
             if p.id == pid:
+                # 状态机：已 approved/rejected 的不能再次修改
+                if p.status in ("approved", "rejected"):
+                    return jsonify({"error": f"pheromone already {p.status}, cannot change"}), 409
                 p.judgment_status = judgment
                 p.status = judgment
                 return jsonify(p.to_dict())

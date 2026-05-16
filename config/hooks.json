@@ -1,3 +1,8 @@
 {
-  "on_create": {}
+  "on_create": {
+    "type": {
+      "action": "reply",
+      "sender": 123
+    }
+  }
 }
