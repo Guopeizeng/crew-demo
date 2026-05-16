@@ -41,6 +41,11 @@
 | Hook 死锁 | trigger_hooks 在锁外调用 | ✅ v2.1 |
 | 链路递归循环 | visited 检测防止栈溢出 | ✅ v2.1 |
 | DLQ 竞态 | check_dlq 内部加锁 | ✅ v2.1 |
+| agent_id 注入 | 禁止 ../，限制字符集 a-zA-Z0-9_- | ✅ v2.1 |
+| content 长度 | 限制 ≤10000 字符 | ✅ v2.1 |
+| type 格式 | 限制 ≤64 字符 alphanumeric | ✅ v2.1 |
+| metadata 注入 | 禁止 __ 开头键名 | ✅ v2.1 |
+| 状态机保护 | 已审批不可二次修改 | ✅ v2.1 |
 
 ---
 
