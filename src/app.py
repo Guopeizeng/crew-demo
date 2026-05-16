@@ -133,15 +133,36 @@ def compute_hop_count(parent_id):
     return 0
 
 def check_dlq():
+    """检查超时 pheromone，移入 DLQ（需锁保护）"""
     global dlq
-    for p in pheromones:
-        if p.status == Pheromone.STATUS_PENDING and p.get_age_seconds() > PENDING_TIMEOUT_SEC:
-            p.status = Pheromone.STATUS_TIMEOUT
-            p.metadata[DLQ_TAG] = True
-            p.metadata["timeout_at"] = datetime.utcnow().isoformat() + "Z"
-            if p not in dlq:
-                dlq.append(p)
+    with _pheromone_lock:
+        for p in pheromones:
+            if p.status == Pheromone.STATUS_PENDING and p.get_age_seconds() > PENDING_TIMEOUT_SEC:
+                p.status = Pheromone.STATUS_TIMEOUT
+                p.metadata[DLQ_TAG] = True
+                p.metadata["timeout_at"] = datetime.utcnow().isoformat() + "Z"
+                if p not in dlq:
+                    dlq.append(p)
     return dlq
+
+def cleanup_ttl():
+    """清理 TTL 过期的 pheromone"""
+    now = datetime.utcnow()
+    global pheromones
+    with _pheromone_lock:
+        original_len = len(pheromones)
+        pheromones = [p for p in pheromones if not is_expired(p)]
+        removed = original_len - len(pheromones)
+    return removed
+
+def is_expired(p):
+    """检查 pheromone 是否已过期（TTL 或 explicit expiration）"""
+    if p.status in (Pheromone.STATUS_APPROVED, Pheromone.STATUS_REJECTED, Pheromone.STATUS_TIMEOUT):
+        return False
+    ttl = p.metadata.get("ttl_seconds")
+    if ttl:
+        return p.get_age_seconds() > ttl
+    return False
 
 def trigger_hooks(p):
     """根据 hooks.json 配置，在 pheromone 创建后触发"""
@@ -217,6 +238,7 @@ def update_agent(agent_id):
 @app.route("/api/pheromones", methods=["GET"])
 def get_pheromones():
     check_dlq()
+    cleanup_ttl()
     return jsonify([p.to_dict() for p in pheromones])
 
 @app.route("/api/pheromones", methods=["POST"])
@@ -229,16 +251,18 @@ def create_pheromone():
     parent_id = data.get("parent_pheromone_id")
     hop_count = compute_hop_count(parent_id)
 
+    # 创建 pheromone（不含 hop_count，让 compute_hop_count 算）
+    p = Pheromone(
+        type=data.get("type", "message"),
+        sender=sender,
+        targets=data.get("targets", []),
+        content=data.get("content", ""),
+        parent_pheromone_id=parent_id,
+        metadata=data.get("metadata", {}),
+        hop_count=hop_count
+    )
+
     with _pheromone_lock:
-        p = Pheromone(
-            type=data.get("type", "message"),
-            sender=sender,
-            targets=data.get("targets", []),
-            content=data.get("content", ""),
-            parent_pheromone_id=parent_id,
-            metadata=data.get("metadata", {}),
-            hop_count=hop_count
-        )
         pheromones.append(p)
 
         if p.should_escalate():
@@ -246,10 +270,10 @@ def create_pheromone():
             p.metadata["human_intervention"] = True
             p.status = Pheromone.STATUS_TIMEOUT
 
-        # 触发 hook
-        trigger_hooks(p)
+    # 锁外调用 trigger（防止死锁）
+    trigger_hooks(p)
 
-        return jsonify(p.to_dict()), 201
+    return jsonify(p.to_dict()), 201
 
 @app.route("/api/pheromones/<pid>", methods=["GET"])
 def get_pheromone(pid):
@@ -257,6 +281,50 @@ def get_pheromone(pid):
         if p.id == pid:
             return jsonify(p.to_dict())
     return jsonify({"error": "not found"}), 404
+
+@app.route("/api/pheromones/<pid>/judge", methods=["PUT"])
+def judge_pheromone(pid):
+    """审批 pheromone（approve/reject）"""
+    data = request.json or {}
+    judgment = data.get("judgment_status")
+    if judgment not in ("approved", "rejected"):
+        return jsonify({"error": "judgment_status must be approved or rejected"}), 400
+
+    with _pheromone_lock:
+        for p in pheromones:
+            if p.id == pid:
+                p.judgment_status = judgment
+                p.status = judgment
+                return jsonify(p.to_dict())
+
+    return jsonify({"error": "not found"}), 404
+
+@app.route("/api/chain/<pid>/tree", methods=["GET"])
+def get_chain_tree(pid):
+    """获取链路树形结构（分支可视化）"""
+    visited = set()
+
+    def build_tree(p_id):
+        if p_id in visited:
+            return None
+        visited.add(p_id)
+        p = next((x for x in pheromones if x.id == p_id), None)
+        if not p:
+            return None
+        node = p.to_dict()
+        children = []
+        for child in pheromones:
+            if child.parent_pheromone_id == p_id and child.id not in visited:
+                child_node = build_tree(child.id)
+                if child_node:
+                    children.append(child_node)
+        node["children"] = children
+        return node
+
+    root = build_tree(pid)
+    if not root:
+        return jsonify({"error": "pheromone not found"}), 404
+    return jsonify(root)
 
 @app.route("/api/chain/<pid>", methods=["GET"])
 def get_chain(pid):
@@ -281,12 +349,17 @@ def get_chain(pid):
 
     return jsonify(chain)
 
-def get_sub_chain(pid):
+def get_sub_chain(pid, visited=None):
+    if visited is None:
+        visited = set()
+    if pid in visited:
+        return []
+    visited.add(pid)
     sub = []
     for p in pheromones:
-        if p.parent_pheromone_id == pid:
+        if p.parent_pheromone_id == pid and p.id not in visited:
             sub.append(p.to_dict())
-            sub.extend(get_sub_chain(p.id))
+            sub.extend(get_sub_chain(p.id, visited))
     return sub
 
 @app.route("/api/dlq", methods=["GET"])
@@ -742,23 +815,53 @@ def index():
             if (ps.length === 0) {
                 list.innerHTML = '<div class="empty-state">No pheromones yet...</div>';
             } else {
-                list.innerHTML = ps.map(p => `
+                list.innerHTML = ps.map(p => {
+                    const statusBadge = p.status === 'pending' ? '<span style="background:#fbbf24;color:#000;padding:2px 6px;border-radius:3px;font-size:11px;">pending</span>' :
+                                         p.status === 'approved' ? '<span style="background:#22c55e;color:#000;padding:2px 6px;border-radius:3px;font-size:11px;">approved</span>' :
+                                         p.status === 'rejected' ? '<span style="background:#ef4444;color:#fff;padding:2px 6px;border-radius:3px;font-size:11px;">rejected</span>' :
+                                         '<span style="background:#666;color:#fff;padding:2px 6px;border-radius:3px;font-size:11px;">' + p.status + '</span>';
+                    const actionBtns = p.status === 'pending' ? `
+                        <button onclick="judgePheromone('${p.id}', 'approved')" style="background:#22c55e;color:#000;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;margin-left:8px;">✓</button>
+                        <button onclick="judgePheromone('${p.id}', 'rejected')" style="background:#ef4444;color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;margin-left:4px;">✗</button>
+                    ` : '';
+                    return `
                     <div class="pheromone-item">
                         <div class="pheromone-badge">${p.type}</div>
-                        <div class="pheromone-content">${p.content}</div>
+                        <div class="pheromone-content">${p.content.substring(0, 60)}${p.content.length > 60 ? '...' : ''}</div>
                         <div class="pheromone-meta">
                             <span>${p.sender}</span>
                             ${p.parent_pheromone_id ? ` → <span>${p.parent_pheromone_id}</span>` : ""}
                             <span class="hop-badge">hop ${p.hop_count}</span>
+                            ${statusBadge}
+                            ${actionBtns}
                         </div>
                     </div>
-                `).join("");
+                `}).join("");
             }
+        }
+
+        async function judgePheromone(pid, judgment) {
+            await fetch("/api/pheromones/" + pid + "/judge", {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ judgment_status: judgment })
+            });
+            await loadPheromones();
         }
 
         async function loadChain() {
             const pid = document.getElementById("chain-pid").value.trim();
             if (!pid) { alert("Enter pheromone ID"); return; }
+
+            // 先尝试树形结构
+            const treeResp = await fetch("/api/chain/" + pid + "/tree");
+            if (treeResp.ok) {
+                const tree = await treeResp.json();
+                renderChainTree(tree, pid);
+                return;
+            }
+
+            // 降级到线性
             const chain = await fetch("/api/chain/" + pid).then(r => r.json());
             const result = document.getElementById("chain-result");
             if (chain.length === 0) {
@@ -774,6 +877,33 @@ def index():
                     </div>
                 `).join("");
             }
+        }
+
+        function renderChainTree(node, rootId, depth = 0) {
+            const result = document.getElementById("chain-result");
+            const indent = depth * 20;
+
+            // 构建当前节点
+            let html = `<div style="margin-left:${indent}px;padding:4px 0;border-left:1px solid #333;">`;
+            html += `<div class="chain-node" style="display:inline-flex;gap:8px;margin:2px 0;">
+                <span class="pheromone-badge">${node.type}</span>
+                <span>${node.sender || 'unknown'}</span>
+                <span style="color:#555;font-size:12px;">${(node.content || '').substring(0,40)}${(node.content || '').length > 40 ? '...' : ''}</span>
+                <span class="hop-badge">${node.hop_count}</span>
+                ${node.status ? '<span style="font-size:11px;color:#888;">' + node.status + '</span>' : ''}
+            </div>`;
+
+            // 递归渲染子节点
+            if (node.children && node.children.length > 0) {
+                html += '<div style="margin-left:' + (indent + 10) + 'px;">';
+                for (const child of node.children) {
+                    html += renderChainTree(child, node.id, depth + 1);
+                }
+                html += '</div>';
+            }
+
+            html += '</div>';
+            result.innerHTML = html;
         }
 
         async function loadHooks() {
